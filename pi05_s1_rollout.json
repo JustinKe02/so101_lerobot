@@ -1,0 +1,50 @@
+{
+  "robot": {
+    "type": "so101_follower",
+    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7C123192-if00",
+    "id": "tk_follower",
+    "calibration_dir": "/data/cqy_workspace/tk/hf_cache/huggingface/lerobot/calibration/robots/so_follower",
+    "max_relative_target": 5.0,
+    "cameras": {
+      "top": {
+        "type": "opencv",
+        "index_or_path": "/dev/video4",
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "backend": 200
+      },
+      "wrist": {
+        "type": "opencv",
+        "index_or_path": "/dev/video6",
+        "width": 640,
+        "height": 480,
+        "fps": 30,
+        "backend": 200
+      }
+    }
+  },
+  "policy": {
+    "path": "/data/cqy_workspace/tk/lerobot_src/outputs/train/pi05_so101_expert_only_10epochs_bs32_seed1000/checkpoints/005613/pretrained_model"
+  },
+  "strategy": {
+    "type": "base"
+  },
+  "inference": {
+    "type": "rtc",
+    "queue_threshold": 20,
+    "rtc": {
+      "execution_horizon": 10,
+      "max_guidance_weight": 10.0,
+      "prefix_attention_schedule": "EXP"
+    }
+  },
+  "fps": 30,
+  "duration": 30,
+  "interpolation_multiplier": 1,
+  "device": "cuda",
+  "task": "Put the block in the bin",
+  "display_data": false,
+  "play_sounds": false,
+  "return_to_initial_position": true
+}
