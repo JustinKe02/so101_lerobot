@@ -2114,6 +2114,10 @@ def evaluate_model(
             postprocessor.reset()
             policy.reset()
             raw_sample = torch.utils.data.default_collate([dataset[frame.row_index]])
+            # This is an inference batch. Ground-truth actions are evaluated
+            # separately below and must not activate training-only processors.
+            raw_sample.pop("action", None)
+            raw_sample.pop("action_is_pad", None)
             processed_sample = preprocessor(raw_sample)
 
             predictions = []

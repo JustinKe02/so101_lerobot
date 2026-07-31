@@ -47,6 +47,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .evo1.configuration_evo1 import Evo1Config
 from .groot.configuration_groot import GrootConfig
+from .pi05.configuration_pi05 import PI05Config
 from .pretrained import PreTrainedPolicy
 from .utils import validate_visual_features_consistency
 
@@ -214,6 +215,14 @@ def make_pre_post_processors(
             from .evo1.processor_evo1 import reconcile_evo1_processors
 
             preprocessor, postprocessor = reconcile_evo1_processors(
+                policy_cfg,
+                preprocessor,
+                postprocessor,
+            )
+        elif isinstance(policy_cfg, PI05Config):
+            from .pi05.processor_pi05 import reconcile_pi05_processors
+
+            preprocessor, postprocessor = reconcile_pi05_processors(
                 policy_cfg,
                 preprocessor,
                 postprocessor,

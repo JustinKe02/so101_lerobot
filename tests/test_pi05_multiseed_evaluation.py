@@ -812,6 +812,7 @@ def test_evaluate_model_cpu_smoke_uses_explicit_noise_and_ignores_tail_padding(m
 
         def predict_action_chunk(self, batch, *, noise):
             assert batch["observation.state"].shape == (1, 2)
+            assert "action" not in batch
             self.noises.append(noise.clone())
             prediction = torch.zeros(1, 50, 2)
             if float(batch["observation.state"][0, 1]) == 0.0:

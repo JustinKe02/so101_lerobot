@@ -30,7 +30,12 @@ from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 from lerobot.utils.device_utils import auto_select_torch_device, is_torch_device_available
 
-from .inference import InferenceEngineConfig, RTCInferenceConfig, SyncInferenceConfig
+from .inference import (
+    InferenceEngineConfig,
+    RTCInferenceConfig,
+    SyncInferenceConfig,
+    VLASHInferenceConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -263,7 +268,7 @@ class RolloutConfig:
     # Strategy (polymorphic: --strategy.type=base|sentry|highlight|dagger)
     strategy: RolloutStrategyConfig = field(default_factory=BaseStrategyConfig)
 
-    # Inference backend (polymorphic: --inference.type=sync|rtc)
+    # Inference backend (polymorphic: --inference.type=sync|rtc|vlash)
     inference: InferenceEngineConfig = field(default_factory=SyncInferenceConfig)
 
     # Dataset (required for sentry, highlight, dagger; None for base)
@@ -299,6 +304,11 @@ class RolloutConfig:
     # positions captured at startup before disconnecting.  Set to False to
     # leave the robot in its final achieved pose at shutdown.
     return_to_initial_position: bool = True
+
+    # Additional settling time after every robot camera has connected. Camera
+    # threads continue capturing during this delay so auto-exposure can
+    # converge before the first policy observation.
+    camera_warmup_s: float = 0.0
 
     # Torch compile
     use_torch_compile: bool = False
@@ -416,6 +426,8 @@ class RolloutConfig:
 
         if isinstance(self.inference, RTCInferenceConfig):
             self.inference.validate_policy_chunk_size(getattr(self.policy, "chunk_size", None))
+        elif isinstance(self.inference, VLASHInferenceConfig):
+            self.inference.validate_policy(self.policy)
 
         if (
             isinstance(self.inference, RTCInferenceConfig)
@@ -428,6 +440,10 @@ class RolloutConfig:
             raise ValueError("stall_guard_ticks must be >= 0 (0 disables the guard)")
         if not math.isfinite(self.stall_guard_tolerance) or self.stall_guard_tolerance < 0:
             raise ValueError("stall_guard_tolerance must be finite and >= 0")
+        if not math.isfinite(self.camera_warmup_s) or self.camera_warmup_s < 0:
+            raise ValueError("camera_warmup_s must be finite and >= 0")
+        if isinstance(self.inference, VLASHInferenceConfig) and self.interpolation_multiplier != 1:
+            raise ValueError("VLASH feedback-aware inference requires --interpolation_multiplier=1")
 
         # --- Task resolution ---
         # When any --dataset.* flag is passed, draccus creates a DatasetRecordConfig with single_task="".
@@ -471,6 +487,11 @@ class RolloutConfig:
         if self.use_pi05_tensorrt_prefix:
             if self.policy.type != "pi05":
                 raise ValueError("--pi05_tensorrt_prefix_engine can only be used with a pi05 policy")
+            if getattr(self.policy, "fuse_qkv", False) or getattr(self.policy, "fuse_gate_up", False):
+                raise ValueError(
+                    "PI0.5 projection fusion changes the prefix weight layout and cannot be combined "
+                    "with --pi05_tensorrt_prefix_engine; leave fuse_qkv=false and fuse_gate_up=false"
+                )
             if not self.device.startswith("cuda"):
                 raise ValueError("--pi05_tensorrt_prefix_engine requires a CUDA device")
             if self.use_torch_compile:

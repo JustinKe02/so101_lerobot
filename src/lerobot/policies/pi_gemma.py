@@ -273,7 +273,15 @@ class PiGemmaModel(GemmaModel):  # type: ignore[misc]
         # embed positions
         hidden_states = inputs_embeds
         # Convert to bfloat16 if the first layer uses bfloat16
-        if len(self.layers) > 0 and self.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+        first_attention = self.layers[0].self_attn if len(self.layers) > 0 else None
+        first_projection = (
+            first_attention.qkv_proj
+            if first_attention is not None and hasattr(first_attention, "qkv_proj")
+            else first_attention.q_proj
+            if first_attention is not None
+            else None
+        )
+        if first_projection is not None and first_projection.weight.dtype == torch.bfloat16:
             hidden_states = hidden_states.to(torch.bfloat16)
 
         # create position embeddings to be shared across the decoder layers

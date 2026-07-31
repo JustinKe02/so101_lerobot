@@ -24,6 +24,7 @@ import torch
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
+    AddBatchDimensionProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
@@ -37,6 +38,112 @@ from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import OBS_STATE
 
 from .configuration_pi05 import PI05Config
+
+
+@ProcessorStepRegistry.register(name="pi05_temporal_offset_processor_step")
+@dataclass
+class Pi05TemporalOffsetProcessorStep(ProcessorStep):
+    """Select matching future state/action windows while keeping current images."""
+
+    max_offset_steps: int = 0
+    chunk_size: int = 50
+
+    def get_config(self) -> dict[str, int]:
+        return {"max_offset_steps": self.max_offset_steps, "chunk_size": self.chunk_size}
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        if self.max_offset_steps <= 0:
+            return transition
+
+        action = transition.get(TransitionKey.ACTION)
+        observation = transition.get(TransitionKey.OBSERVATION) or {}
+        state = observation.get(OBS_STATE)
+        if action is None:
+            # Inference checkpoints retain this processor, but inference has no
+            # action target or future-state window to select from.
+            return transition
+        if state is None:
+            raise ValueError("PI05 temporal offset augmentation requires observation.state")
+        if action.ndim != 3 or state.ndim != 3:
+            raise ValueError(
+                "PI05 temporal offset augmentation expects batched action/state windows "
+                f"with rank 3, got action={tuple(action.shape)}, state={tuple(state.shape)}"
+            )
+
+        batch_size = action.shape[0]
+        required_action_steps = self.chunk_size + self.max_offset_steps
+        required_state_steps = self.max_offset_steps + 1
+        if action.shape[1] < required_action_steps or state.shape[1] < required_state_steps:
+            raise ValueError(
+                "PI05 temporal offset windows are shorter than configured: "
+                f"action_steps={action.shape[1]} (need {required_action_steps}), "
+                f"state_steps={state.shape[1]} (need {required_state_steps})"
+            )
+
+        offsets = torch.randint(
+            0,
+            self.max_offset_steps + 1,
+            (batch_size,),
+            device=action.device,
+        )
+        batch_indices = torch.arange(batch_size, device=action.device)
+        action_indices = offsets[:, None] + torch.arange(self.chunk_size, device=action.device)[None, :]
+
+        new_transition = transition.copy()
+        new_observation = observation.copy()
+        new_observation[OBS_STATE] = state[batch_indices, offsets]
+        new_transition[TransitionKey.OBSERVATION] = new_observation
+        new_transition[TransitionKey.ACTION] = action[batch_indices[:, None], action_indices]
+
+        complementary = (transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}).copy()
+        action_pad = complementary.get("action_is_pad")
+        if isinstance(action_pad, torch.Tensor) and action_pad.ndim == 2:
+            complementary["action_is_pad"] = action_pad[batch_indices[:, None], action_indices]
+        state_pad = complementary.get(f"{OBS_STATE}_is_pad")
+        if isinstance(state_pad, torch.Tensor) and state_pad.ndim == 2:
+            complementary[f"{OBS_STATE}_is_pad"] = state_pad[batch_indices, offsets]
+        complementary["vlash_offset"] = offsets
+        new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
+def reconcile_pi05_processors(
+    config: PI05Config,
+    preprocessor: PolicyProcessorPipeline,
+    postprocessor: PolicyProcessorPipeline,
+) -> tuple[PolicyProcessorPipeline, PolicyProcessorPipeline]:
+    """Apply current temporal-offset config to a checkpoint-loaded pipeline."""
+    temporal_step = Pi05TemporalOffsetProcessorStep(
+        max_offset_steps=config.temporal_offset_max_steps,
+        chunk_size=config.chunk_size,
+    )
+    steps = list(preprocessor.steps)
+    temporal_idx = next(
+        (idx for idx, step in enumerate(steps) if isinstance(step, Pi05TemporalOffsetProcessorStep)),
+        None,
+    )
+    if temporal_idx is None:
+        insert_idx = next(
+            (idx for idx, step in enumerate(steps) if isinstance(step, RelativeActionsProcessorStep)),
+            next(
+                (
+                    idx + 1
+                    for idx, step in enumerate(steps)
+                    if isinstance(step, AddBatchDimensionProcessorStep)
+                ),
+                0,
+            ),
+        )
+        steps.insert(insert_idx, temporal_step)
+    else:
+        steps[temporal_idx] = temporal_step
+    preprocessor.steps = steps
+    return preprocessor, postprocessor
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -132,6 +239,10 @@ def make_pi05_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         steps.rename_observations,  # To mimic the same processor as pretrained one
         steps.add_batch_dim,
+        Pi05TemporalOffsetProcessorStep(
+            max_offset_steps=config.temporal_offset_max_steps,
+            chunk_size=config.chunk_size,
+        ),
         relative_step,
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization

@@ -22,6 +22,7 @@ and :class:`DatasetContext` — assembled into :class:`RolloutContext`.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from threading import Event
 
@@ -60,6 +61,15 @@ from .robot_wrapper import ThreadSafeRobot
 from .stall_guard import StallContactGuard
 
 logger = logging.getLogger(__name__)
+
+
+def _warm_up_robot_cameras(robot: object, duration_s: float) -> None:
+    cameras = getattr(robot, "cameras", None)
+    if duration_s <= 0 or not cameras:
+        return
+    logger.info("Waiting %.1fs for camera auto-exposure to settle...", duration_s)
+    time.sleep(duration_s)
+    logger.info("Camera auto-exposure warmup complete")
 
 
 @dataclass
@@ -312,6 +322,7 @@ def _build_rollout_context(
     hardware_state.robot = robot
     robot.connect()
     logger.info("Robot connected: %s", robot.name)
+    _warm_up_robot_cameras(robot, getattr(cfg, "camera_warmup_s", 0.0))
 
     # Store the initial joint positions so we can return to a safe pose on shutdown.
     initial_obs = robot.get_observation()

@@ -52,6 +52,7 @@ from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
@@ -159,6 +160,153 @@ def pad_vector(vector, new_dim):
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
 
 
+class FusedQKVLinear(nn.Module):
+    """Packed Q/K/V projection used by the optional inference fusion path."""
+
+    def __init__(self, attention: nn.Module):
+        super().__init__()
+        self.num_heads = attention.config.num_attention_heads
+        self.num_kv_heads = attention.config.num_key_value_heads
+        self.head_dim = attention.head_dim
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        use_bias = attention.q_proj.bias is not None
+        self.proj = nn.Linear(attention.q_proj.in_features, q_size + 2 * kv_size, bias=use_bias)
+        self.proj.to(device=attention.q_proj.weight.device, dtype=attention.q_proj.weight.dtype)
+        with torch.no_grad():
+            self.proj.weight.copy_(
+                torch.cat([attention.q_proj.weight, attention.k_proj.weight, attention.v_proj.weight], dim=0)
+            )
+            if use_bias:
+                self.proj.bias.copy_(
+                    torch.cat([attention.q_proj.bias, attention.k_proj.bias, attention.v_proj.bias], dim=0)
+                )
+
+    @property
+    def weight(self) -> Tensor:
+        return self.proj.weight
+
+    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        batch_size, sequence_length, _ = hidden_states.shape
+        q_size = self.num_heads * self.head_dim
+        kv_size = self.num_kv_heads * self.head_dim
+        query, key, value = self.proj(hidden_states).split((q_size, kv_size, kv_size), dim=-1)
+        query = query.view(batch_size, sequence_length, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(batch_size, sequence_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        value = value.view(batch_size, sequence_length, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        return query, key, value
+
+
+class FusedGemmaAttention(nn.Module):
+    """Gemma attention with one packed QKV matmul and the original output projection."""
+
+    def __init__(self, attention: nn.Module):
+        super().__init__()
+        self.config = attention.config
+        self.layer_idx = attention.layer_idx
+        self.head_dim = attention.head_dim
+        self.num_key_value_groups = attention.num_key_value_groups
+        self.scaling = attention.scaling
+        self.attention_dropout = attention.attention_dropout
+        self.qkv_proj = FusedQKVLinear(attention)
+        self.o_proj = attention.o_proj
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        position_embeddings: tuple[Tensor, Tensor] | None = None,
+        attention_mask: Tensor | None = None,
+        past_key_values=None,
+        **kwargs,
+    ) -> tuple[Tensor, Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        query_states, key_states, value_states = self.qkv_proj(hidden_states)
+        if position_embeddings is None:
+            raise ValueError("position_embeddings are required for fused Gemma attention")
+        cos, sin = position_embeddings
+        query_states, key_states = modeling_gemma.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        attention_interface = modeling_gemma.ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, modeling_gemma.eager_attention_forward
+        )
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+        attn_output = self.o_proj(attn_output.reshape(*input_shape, -1).contiguous())
+        return attn_output, attn_weights
+
+
+class FusedGateUpLinear(nn.Module):
+    """Packed Gemma gate/up projection."""
+
+    def __init__(self, mlp: nn.Module):
+        super().__init__()
+        intermediate_size = mlp.gate_proj.out_features
+        self.intermediate_size = intermediate_size
+        self.proj = nn.Linear(mlp.gate_proj.in_features, 2 * intermediate_size, bias=False)
+        self.proj.to(device=mlp.gate_proj.weight.device, dtype=mlp.gate_proj.weight.dtype)
+        with torch.no_grad():
+            self.proj.weight.copy_(torch.cat([mlp.gate_proj.weight, mlp.up_proj.weight], dim=0))
+
+    @property
+    def weight(self) -> Tensor:
+        return self.proj.weight
+
+    def forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
+        return self.proj(hidden_states).split(self.intermediate_size, dim=-1)
+
+
+class FusedGemmaMLP(nn.Module):
+    """Gemma MLP with one packed gate/up matmul."""
+
+    def __init__(self, mlp: nn.Module):
+        super().__init__()
+        self.gate_up_proj = FusedGateUpLinear(mlp)
+        self.down_proj = mlp.down_proj
+        self.act_fn = mlp.act_fn
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        gate, up = self.gate_up_proj(hidden_states)
+        return self.down_proj(self.act_fn(gate) * up)
+
+
+def _attention_projection_weight(attention: nn.Module) -> Tensor:
+    return attention.qkv_proj.weight if hasattr(attention, "qkv_proj") else attention.q_proj.weight
+
+
+def _mlp_projection_weight(mlp: nn.Module) -> Tensor:
+    return mlp.gate_up_proj.weight if hasattr(mlp, "gate_up_proj") else mlp.up_proj.weight
+
+
+_STATE_CONDITIONING_STATE_DICT_KEYS = frozenset(
+    {
+        "model.state_proj.weight",
+        "model.state_proj.bias",
+        "model.state_mlp_in.weight",
+        "model.state_mlp_in.bias",
+        "model.state_mlp_out.weight",
+        "model.state_mlp_out.bias",
+    }
+)
+
+
+def _disallowed_checkpoint_keys(
+    missing_keys: list[str], unexpected_keys: list[str], *, state_cond: bool
+) -> tuple[list[str], list[str]]:
+    """Keep strict loading while permitting only a legacy state branch gap."""
+    allowed_missing = _STATE_CONDITIONING_STATE_DICT_KEYS if state_cond else frozenset()
+    return [key for key in missing_keys if key not in allowed_missing], list(unexpected_keys)
+
+
 def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
     images: torch.Tensor,
     height: int,
@@ -245,9 +393,12 @@ def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_c
         gates.append(gate)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-        query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        if hasattr(layer.self_attn, "qkv_proj"):
+            query_state, key_state, value_state = layer.self_attn.qkv_proj(hidden_states)
+        else:
+            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
@@ -295,7 +446,7 @@ def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_c
         after_first_residual = out_emb.clone()
         out_emb, gate = layernorm_forward(layer.post_attention_layernorm, out_emb, adarms_cond[i])
         # Convert to bfloat16 if the next layer (mlp) uses bfloat16
-        if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+        if _mlp_projection_weight(layer.mlp).dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
         out_emb = layer.mlp(out_emb)
         # second residual
@@ -593,6 +744,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
+        if config.state_cond:
+            self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
+            self.state_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
+            self.state_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+            # A legacy checkpoint with state_cond enabled must initially behave
+            # exactly like the checkpoint did before the branch was added.
+            nn.init.zeros_(self.state_mlp_out.weight)
+            nn.init.zeros_(self.state_mlp_out.bias)
+
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -610,6 +770,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def release_torch_prefix_modules(self) -> None:
         """Release prefix-only PyTorch weights after a TensorRT engine is selected."""
         self.paligemma_with_expert.paligemma = None
+
+    def apply_inference_fusions(self, *, fuse_qkv: bool, fuse_gate_up: bool) -> None:
+        """Pack Gemma projections after checkpoint loading.
+
+        Fusion is deliberately applied after loading because fused modules use a
+        different state-dict layout. It is intended for inference-only policies.
+        """
+        backbones = [self.paligemma_with_expert.gemma_expert.model]
+        if self.paligemma_with_expert.paligemma is not None:
+            backbones.append(self.paligemma_with_expert.paligemma.model.language_model)
+        for backbone in backbones:
+            for layer in backbone.layers:
+                if fuse_qkv and not hasattr(layer.self_attn, "qkv_proj"):
+                    layer.self_attn = FusedGemmaAttention(layer.self_attn)
+                if fuse_gate_up and not hasattr(layer.mlp, "gate_up_proj"):
+                    layer.mlp = FusedGemmaMLP(layer.mlp)
 
     def _compute_prefix_cache(self, images, img_masks, tokens, masks):
         if self._prefix_cache_backend is not None:
@@ -723,7 +899,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, noisy_actions, timestep):
+    def embed_suffix(self, noisy_actions, timestep, state=None):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -755,6 +931,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         action_time_emb = action_emb
         adarms_cond = time_emb
 
+        if self.config.state_cond:
+            if state is None:
+                raise ValueError("PI05 state_cond requires observation.state")
+            state = pad_vector(state, self.config.max_state_dim).to(dtype=self.state_proj.weight.dtype)
+
+            def state_mlp_func(state):
+                state_emb = self.state_proj(state)
+                state_emb = F.silu(self.state_mlp_in(state_emb))
+                return self.state_mlp_out(state_emb)
+
+            state_emb = self._apply_checkpoint(state_mlp_func, state).to(dtype=adarms_cond.dtype)
+            adarms_cond = adarms_cond + state_emb
+
         embs.append(action_time_emb)
         bsize, action_time_dim = action_time_emb.shape[:2]
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
@@ -770,17 +959,19 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise, time) -> Tensor:
+    def forward(self, images, img_masks, tokens, masks, actions, noise, time, state=None) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time, state)
 
         if (
-            self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
+            _attention_projection_weight(
+                self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn
+            ).dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
@@ -828,6 +1019,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         masks,
         noise=None,
         num_steps=None,
+        state=None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action."""
@@ -861,6 +1053,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     past_key_values=past_key_values,
                     x_t=input_x_t,
                     timestep=current_timestep,
+                    state=state,
                 )
 
             if self._rtc_enabled():
@@ -892,9 +1085,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         past_key_values,
         x_t,
         timestep,
+        state=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep, state)
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]
@@ -1045,8 +1239,18 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
-            # Load the remapped state dict into the model
-            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            # Load non-strictly first so a legacy checkpoint may initialize the
+            # zero-output state-conditioning branch. Preserve strict behavior
+            # for every other missing or unexpected key.
+            missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=False)
+            disallowed_missing, disallowed_unexpected = _disallowed_checkpoint_keys(
+                missing_keys, unexpected_keys, state_cond=model.config.state_cond
+            )
+            if strict and (disallowed_missing or disallowed_unexpected):
+                raise RuntimeError(
+                    "Checkpoint loading failed: "
+                    f"missing={disallowed_missing}, unexpected={disallowed_unexpected}"
+                )
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1073,6 +1277,14 @@ class PI05Policy(PreTrainedPolicy):
 
         except Exception as e:
             print(f"Warning: Could not load state dict: {e}")
+            if strict:
+                raise
+
+        if model.config.fuse_qkv or model.config.fuse_gate_up:
+            model.model.apply_inference_fusions(
+                fuse_qkv=model.config.fuse_qkv,
+                fuse_gate_up=model.config.fuse_gate_up,
+            )
 
         return model
 
@@ -1116,8 +1328,11 @@ class PI05Policy(PreTrainedPolicy):
                 new_key = key.replace("action_time_mlp_in.", "time_mlp_in.")
             elif key.startswith("action_time_mlp_out."):
                 new_key = key.replace("action_time_mlp_out.", "time_mlp_out.")
-            # Also handle state_proj which shouldn't exist in pi05
-            if key.startswith("state_proj."):
+            # Legacy PI0.5 did not have continuous state conditioning.
+            if (
+                key.startswith(("state_proj.", "state_mlp_in.", "state_mlp_out."))
+                and not self.config.state_cond
+            ):
                 logging.warning(f"Skipping state_proj key in pi05 mode: {key}")
                 continue
 
@@ -1235,6 +1450,15 @@ class PI05Policy(PreTrainedPolicy):
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
         return actions
 
+    def prepare_state(self, batch):
+        """Pad the normalized proprioceptive state for continuous conditioning."""
+        state = batch.get(OBS_STATE)
+        if state is None:
+            if self.config.state_cond:
+                raise ValueError("PI05 state_cond requires observation.state")
+            return None
+        return pad_vector(state, self.config.max_state_dim)
+
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations."""
@@ -1260,9 +1484,10 @@ class PI05Policy(PreTrainedPolicy):
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        state = self.prepare_state(batch)
 
-        # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
-        actions = self.model.sample_actions(images, img_masks, tokens, masks, **kwargs)
+        # Sample actions using the model and pass through optional RTC kwargs.
+        actions = self.model.sample_actions(images, img_masks, tokens, masks, state=state, **kwargs)
 
         # Unpad actions to actual action dimension
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1284,36 +1509,53 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)
+        state = self.prepare_state(batch)
 
         noise = self.model.sample_noise(actions.shape, actions.device)
         time = self.model.sample_time(actions.shape[0], actions.device)
 
-        # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
+        losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time, state=state)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
 
-        loss_dict = {
-            "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
-        }
+        action_is_pad = batch.get("action_is_pad")
+        valid = None
+        if isinstance(action_is_pad, torch.Tensor):
+            if action_is_pad.shape != losses.shape[:2]:
+                raise ValueError(
+                    "action_is_pad must match PI05 loss time dimensions: "
+                    f"pad={tuple(action_is_pad.shape)}, loss={tuple(losses.shape[:2])}"
+                )
+            valid = ~action_is_pad.to(device=losses.device, dtype=torch.bool)
+            losses = losses * valid.unsqueeze(-1)
+
+        if valid is None:
+            loss_per_dim = losses.mean(dim=(0, 1))
+            per_sample_loss = losses.mean(dim=(1, 2))
+        else:
+            valid_per_dim = valid.sum().clamp_min(1)
+            loss_per_dim = losses.sum(dim=(0, 1)) / valid_per_dim
+            valid_per_sample = (valid.sum(dim=1) * losses.shape[2]).clamp_min(1)
+            per_sample_loss = losses.sum(dim=(1, 2)) / valid_per_sample
+
+        loss_dict = {"loss_per_dim": loss_per_dim.detach().cpu().numpy().tolist()}
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
-            loss = losses.mean()
+            loss = per_sample_loss.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0.5 fine-tuning."""
         common_projections = (
-            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
+            "state_proj|state_mlp_in|state_mlp_out|action_in_proj|action_out_proj|time_mlp_in|time_mlp_out"
         )
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
         return {

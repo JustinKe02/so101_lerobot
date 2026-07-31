@@ -25,6 +25,19 @@ import pytest
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 
+def test_camera_warmup_waits_only_when_cameras_are_present(monkeypatch):
+    from lerobot.rollout import context as context_module
+
+    sleep = MagicMock()
+    monkeypatch.setattr(context_module.time, "sleep", sleep)
+
+    context_module._warm_up_robot_cameras(SimpleNamespace(cameras={"top": object()}), 5.0)
+    context_module._warm_up_robot_cameras(SimpleNamespace(cameras={}), 5.0)
+    context_module._warm_up_robot_cameras(SimpleNamespace(cameras={"top": object()}), 0.0)
+
+    sleep.assert_called_once_with(5.0)
+
+
 def _context_config(*, teleop=None):
     return SimpleNamespace(
         policy=SimpleNamespace(

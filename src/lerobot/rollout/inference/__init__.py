@@ -23,10 +23,12 @@ from .factory import (
     InferenceEngineConfig,
     RTCInferenceConfig,
     SyncInferenceConfig,
+    VLASHInferenceConfig,
     create_inference_engine,
 )
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
+from .vlash import VLASHInferenceEngine, VLASHInferenceStats
 
 __all__ = [
     "InferenceEngine",
@@ -35,5 +37,8 @@ __all__ = [
     "RTCInferenceEngine",
     "SyncInferenceConfig",
     "SyncInferenceEngine",
+    "VLASHInferenceConfig",
+    "VLASHInferenceEngine",
+    "VLASHInferenceStats",
     "create_inference_engine",
 ]

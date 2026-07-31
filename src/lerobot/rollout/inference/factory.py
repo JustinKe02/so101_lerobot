@@ -14,7 +14,7 @@
 
 """Inference engine configs and factory.
 
-Selection is explicit via ``--inference.type=sync|rtc``.  Adding a new
+Selection is explicit via ``--inference.type=sync|rtc|vlash``.  Adding a new
 backend requires registering its config subclass and dispatching it in
 :func:`create_inference_engine`.
 """
@@ -38,6 +38,7 @@ from ..robot_wrapper import ThreadSafeRobot
 from .base import InferenceEngine
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
+from .vlash import VLASHInferenceEngine
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,78 @@ class RTCInferenceConfig(InferenceEngineConfig):
             )
 
 
+@InferenceEngineConfig.register_subclass("vlash")
+@dataclass
+class VLASHInferenceConfig(InferenceEngineConfig):
+    """Future-state-aware asynchronous fixed-chunk inference."""
+
+    execution_horizon: int = 10
+    inference_overlap_steps: int = 5
+    max_future_state_delta: float | None = None
+    deadline_miss_limit: int = 1
+    latency_window_size: int = 64
+    timing_diagnostics: bool = False
+    require_state_conditioning: bool = True
+    require_offset_training: bool = True
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("execution_horizon", self.execution_horizon),
+            ("inference_overlap_steps", self.inference_overlap_steps),
+            ("deadline_miss_limit", self.deadline_miss_limit),
+            ("latency_window_size", self.latency_window_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"VLASH {name} must be a positive integer")
+        if self.inference_overlap_steps > self.execution_horizon:
+            raise ValueError("VLASH inference_overlap_steps cannot exceed execution_horizon")
+        if self.max_future_state_delta is not None and (
+            isinstance(self.max_future_state_delta, bool)
+            or not isinstance(self.max_future_state_delta, (int, float))
+            or not math.isfinite(self.max_future_state_delta)
+            or self.max_future_state_delta <= 0
+        ):
+            raise ValueError("VLASH max_future_state_delta must be finite and positive when set")
+
+    def validate_policy(self, policy_config: object) -> None:
+        """Reject checkpoints that do not satisfy the future-state contract."""
+        policy_type = getattr(policy_config, "type", None)
+        if policy_type != "pi05":
+            raise ValueError(f"VLASH inference currently requires a pi05 policy, got {policy_type!r}")
+
+        chunk_size = getattr(policy_config, "chunk_size", None)
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int):
+            raise ValueError("VLASH requires an integer policy chunk_size")
+        if self.execution_horizon > chunk_size:
+            raise ValueError(
+                "VLASH execution_horizon cannot exceed policy chunk_size: "
+                f"execution_horizon={self.execution_horizon}, chunk_size={chunk_size}"
+            )
+
+        if self.require_state_conditioning and not getattr(policy_config, "state_cond", False):
+            raise ValueError(
+                "VLASH requires a state-conditioned PI0.5 checkpoint; train with "
+                "--policy.state_cond=true or set --inference.require_state_conditioning=false "
+                "for an explicit ablation"
+            )
+
+        offset_steps = getattr(policy_config, "temporal_offset_max_steps", 0)
+        required_offset_steps = self.inference_overlap_steps + 1
+        if self.require_offset_training and (
+            isinstance(offset_steps, bool)
+            or not isinstance(offset_steps, int)
+            or offset_steps < required_offset_steps
+        ):
+            raise ValueError(
+                "VLASH feedback projection (overlap plus the dispatched action) must be covered by "
+                "the policy's "
+                "temporal_offset_max_steps: "
+                f"required_offset={required_offset_steps}, trained_offset={offset_steps!r}; "
+                "retrain with a sufficient offset or set "
+                "--inference.require_offset_training=false for an explicit ablation"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
@@ -250,6 +323,28 @@ def create_inference_engine(
             prefix_health_severe_residual_threshold=config.prefix_health_severe_residual_threshold,
             prefix_health_consecutive_severe=config.prefix_health_consecutive_severe,
             prefix_health_safety_stop_replans=config.prefix_health_safety_stop_replans,
+            shutdown_event=shutdown_event,
+        )
+    if isinstance(config, VLASHInferenceConfig):
+        config.validate_policy(policy.config)
+        return VLASHInferenceEngine(
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            robot_wrapper=robot_wrapper,
+            hw_features=hw_features,
+            ordered_action_keys=ordered_action_keys,
+            task=task,
+            fps=fps,
+            device=device,
+            execution_horizon=config.execution_horizon,
+            inference_overlap_steps=config.inference_overlap_steps,
+            max_future_state_delta=config.max_future_state_delta,
+            deadline_miss_limit=config.deadline_miss_limit,
+            latency_window_size=config.latency_window_size,
+            timing_diagnostics=config.timing_diagnostics,
+            use_torch_compile=use_torch_compile,
+            compile_warmup_inferences=compile_warmup_inferences,
             shutdown_event=shutdown_event,
         )
     raise ValueError(f"Unknown inference engine type: {type(config).__name__}")

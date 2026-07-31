@@ -136,6 +136,78 @@ lerobot-train \
     ...
 ```
 
+## VLASH-Style Asynchronous Inference
+
+LeRobot provides a `vlash` inference backend inspired by
+[MIT HAN Lab VLASH](https://github.com/mit-han-lab/vlash). It keeps the current image observation but
+trains PI0.5 on randomly offset future proprioceptive states and action windows. During rollout, the
+backend estimates the state at the end of the active action chunk and predicts the next fixed chunk in
+a background thread. Unlike RTC, a completed VLASH chunk is already future-aligned and is therefore
+switched in without latency slicing or action-prefix merging.
+
+This is a LeRobot-native integration, not a dependency on the upstream VLASH environment. It preserves
+PI0.5 quantile normalization and the existing rollout action filter, robot safety clamp, stall guard, and
+TensorRT prefix backend gates.
+
+### Train a State-Conditioned Checkpoint
+
+Enable both continuous state conditioning and future-offset augmentation when fine-tuning:
+
+```bash
+lerobot-train \
+    --dataset.repo_id=your_dataset \
+    --policy.type=pi05 \
+    --policy.pretrained_path=lerobot/pi05_base \
+    --policy.state_cond=true \
+    --policy.temporal_offset_max_steps=8 \
+    --output_dir=./outputs/pi05_vlash \
+    --policy.device=cuda \
+    --batch_size=32 \
+    --steps=3000
+```
+
+The state-conditioning output projection is zero-initialized, so a legacy checkpoint initially keeps its
+old behavior when the branch is added. That compatibility does not make the legacy checkpoint
+future-state-aware: it still needs fine-tuning with the flags above. Images remain at the current timestep;
+only `observation.state`, `action`, and their padding masks use the sampled shared offset.
+
+Set `temporal_offset_max_steps` greater than or equal to the largest deployment
+`inference_overlap_steps`. For example, offset `8` covers an overlap of `5`.
+
+### Roll Out with Fixed Chunk Switching
+
+```bash
+lerobot-rollout \
+    --strategy.type=base \
+    --inference.type=vlash \
+    --inference.execution_horizon=10 \
+    --inference.inference_overlap_steps=5 \
+    --inference.max_future_state_delta=5.0 \
+    --inference.timing_diagnostics=true \
+    --policy.path=./outputs/pi05_vlash/checkpoints/last/pretrained_model \
+    --robot.type=so101_follower \
+    --robot.port=/dev/ttyACM0 \
+    --task="Pick up the block" \
+    --fps=30 \
+    --device=cuda
+```
+
+`max_future_state_delta` applies a per-joint clamp at every simulated state step. For SO-101, start with
+the same numeric limit as `--robot.max_relative_target`. The rollout fails closed when the next chunk is
+not ready at the chunk boundary. Keep the existing action filter and stall guard enabled as appropriate
+for the robot; VLASH does not replace those dispatch-time safety mechanisms.
+
+By default, deployment requires `state_cond=true` and enough offset-training coverage. The
+`require_state_conditioning=false` and `require_offset_training=false` options exist only for explicit
+ablations. Projection fusion is optional through `--policy.fuse_qkv=true` and
+`--policy.fuse_gate_up=true`; validate checkpoint-level action parity before using either on hardware.
+These fusions require the PyTorch prefix backend and cannot be combined with a TensorRT prefix engine,
+whose verification report is bound to the original prefix weight layout. Action quantization is
+intentionally not part of the initial VLASH path.
+
+The generic launcher at `examples/inference/run_pi05_vlash.sh` supplies the VLASH defaults while leaving
+robot and camera arguments explicit.
+
 ## Performance Results
 
 ### Libero Benchmark Results

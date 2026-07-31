@@ -242,6 +242,11 @@ def test_rollout_rejects_actual_consumed_with_interpolation() -> None:
         _make_rollout_config(inference=inference, interpolation_multiplier=2)
 
 
+def test_rollout_rejects_negative_camera_warmup() -> None:
+    with pytest.raises(ValueError, match="camera_warmup_s must be finite and >= 0"):
+        _make_rollout_config(camera_warmup_s=-1.0)
+
+
 def test_factory_passes_actual_consumed_guidance_configuration() -> None:
     config = RTCInferenceConfig(
         timing_mode="actual_consumed",
@@ -316,6 +321,23 @@ def test_explicit_action_pytorch_ignores_stale_engine(caplog: pytest.LogCaptureF
 def test_explicit_prefix_tensorrt_requires_engine() -> None:
     with pytest.raises(ValueError, match="requires --pi05_tensorrt_prefix_engine"):
         _make_rollout_config(pi05_prefix_backend="tensorrt")
+
+
+def test_prefix_tensorrt_rejects_projection_fusion() -> None:
+    policy = SimpleNamespace(
+        type="pi05",
+        device="cuda",
+        fuse_qkv=True,
+        fuse_gate_up=False,
+    )
+
+    with pytest.raises(ValueError, match="projection fusion"):
+        _make_rollout_config(
+            policy=policy,
+            device="cuda",
+            pi05_prefix_backend="tensorrt",
+            pi05_tensorrt_prefix_engine="prefix.plan",
+        )
 
 
 def test_explicit_action_tensorrt_requires_engine() -> None:

@@ -40,6 +40,16 @@ class PI05Config(PreTrainedConfig):
     max_state_dim: int = 32
     max_action_dim: int = 32
 
+    # VLASH-style continuous state conditioning. The additional branch is
+    # zero-initialized so enabling it while loading a legacy checkpoint keeps
+    # the original policy output unchanged until it is fine-tuned.
+    state_cond: bool = False
+
+    # Training-time future-state augmentation. A value N samples an offset in
+    # [0, N] and pairs the current visual observation with state/action targets
+    # from that future offset.
+    temporal_offset_max_steps: int = 0
+
     # Flow matching parameters: see openpi `PI0Pytorch`
     num_inference_steps: int = 10
     time_sampling_beta_alpha: float = 1.5
@@ -81,6 +91,8 @@ class PI05Config(PreTrainedConfig):
     gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory optimization
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
+    fuse_qkv: bool = False  # Inference-only fused Q/K/V projections
+    fuse_gate_up: bool = False  # Inference-only fused Gemma gate/up projections
     device: str | None = None  # Device to use for the model (None = auto-detect)
 
     # Finetuning settings
@@ -120,6 +132,13 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        if (
+            isinstance(self.temporal_offset_max_steps, bool)
+            or not isinstance(self.temporal_offset_max_steps, int)
+            or self.temporal_offset_max_steps < 0
+        ):
+            raise ValueError("temporal_offset_max_steps must be a non-negative integer")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
@@ -168,7 +187,7 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        return list(range(self.chunk_size))
+        return list(range(self.chunk_size + self.temporal_offset_max_steps))
 
     @property
     def reward_delta_indices(self) -> None:
