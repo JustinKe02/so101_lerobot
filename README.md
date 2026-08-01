@@ -37,6 +37,78 @@ lerobot-info
 > [!IMPORTANT]
 > For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
 
+## 当前分支：PI0.5 + VLASH SO-101 抓取
+
+本分支在 LeRobot PI0.5 上集成了受
+[MIT HAN Lab VLASH](https://github.com/mit-han-lab/vlash) 启发的异步推理链路，并完成了
+SO-101 双相机抓取任务的训练、离线回放和真机闭环验证。该实现为 LeRobot 原生后端，不依赖
+上游 VLASH 运行环境。
+
+主要改动包括：
+
+- 为 PI0.5 增加连续关节状态条件和 temporal offset 数据增强。
+- 在执行当前 action chunk 时，预测 chunk 边界的未来机械臂状态并异步生成下一 chunk。
+- 使用策略动作、过滤后动作、机器人实际下发动作和关节观测估计真实跟踪增益。
+- 保留 LeRobot 的动作后处理、机器人侧限幅和 deadline fail-closed 机制。
+- 提供训练脚本、数据集回放评估脚本和通用真机启动脚本。
+
+### 当前实验结果
+
+| 项目           | 结果                                                           |
+| -------------- | -------------------------------------------------------------- |
+| 数据集         | 40 episodes，17,960 帧，top + wrist 双相机，30 Hz              |
+| 数据划分       | 全部用于训练，无独立验证集                                     |
+| 训练           | 10 epochs，5,613 steps，batch size 32                          |
+| VLASH 训练配置 | `state_cond=true`，`temporal_offset_max_steps=8`               |
+| 最终训练 loss  | `0.012`，epoch 6 后逐渐进入平台期                              |
+| 真机推理配置   | 30 Hz，horizon 10，overlap 5，future-state delta 5.0           |
+| 60 秒真机控制  | 1,778 次动作反馈，约 29.6 Hz                                   |
+| 稳态推理时延   | P95 134.76 ms，最大 157.18 ms，deadline miss 0                 |
+| 当前效果       | 已完成物体接近、夹取和搬运的真机闭环验证，但速度与泛化仍需优化 |
+
+RTC 与 VLASH 是两个可选推理后端，不会在当前链路中叠加运行。RTC 使用旧动作 prefix guidance
+和实际消耗步数融合新旧 chunk；VLASH 使用预测的未来状态生成下一完整 chunk，并在边界处整块
+切换。当前权重经过状态条件和 temporal offset 训练，真机运行使用 `--inference.type=vlash`。
+
+### 训练与运行
+
+当前 SO-101 实验训练脚本提供 smoke 和完整 10-epoch 两种模式。脚本中的数据、基础权重和环境
+路径需要按实际机器调整：
+
+```bash
+bash src/lerobot/scripts/train_pi05_so101_vlash_10epochs.sh smoke
+bash src/lerobot/scripts/train_pi05_so101_vlash_10epochs.sh full
+```
+
+使用最终权重启动 VLASH 真机推理。机器人端口、标定 ID 和相机配置必须替换为当前设备的实际值：
+
+```bash
+MODEL=outputs/train/pi05_so101_vlash_expert_only_10epochs_bs32_seed1000/checkpoints/005613/pretrained_model
+
+VLASH_DURATION_S=60 bash examples/inference/run_pi05_vlash.sh "$MODEL" \
+  --robot.type=so101_follower \
+  --robot.port=<FOLLOWER_PORT> \
+  --robot.id=<ROBOT_ID> \
+  --robot.cameras='<CAMERA_CONFIG>' \
+  --robot.max_relative_target=5.0 \
+  --task="Put the block in the bin" \
+  --fps=30 \
+  --device=cuda
+```
+
+开始真机运行前，应先核对标定、相机视角、初始姿态、设备占用和机械臂工作空间。当前数据没有
+独立验证集，现有结果不能替代多初始位置、多光照和多物体布局下的成功率评估。机械臂速度偏慢
+主要与动作滤波持续改写、硬件 clamp 和关节跟踪增益偏低有关，不是控制循环未达到 30 Hz。
+
+详细资料：
+
+- [PI0.5 VLASH 使用说明](./docs/source/pi05.mdx#vlash-style-asynchronous-inference)
+- [训练与推理链路报告](./PI05_VLASH_TRAINING_INFERENCE_REPORT_20260730.md)
+- [当前版本与速度分析](./PI05_VLASH_CURRENT_STATUS_SPEED_REPORT_20260730.md)
+- [本周工作总结](./WEEKLY_REPORT_20260727_20260731.md)
+- [VLASH 通用启动脚本](./examples/inference/run_pi05_vlash.sh)
+- [VLASH 数据集回放评估](./examples/inference/evaluate_pi05_vlash_replay.py)
+
 ## Robots & Control
 
 <div align="center">
