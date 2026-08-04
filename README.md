@@ -15,6 +15,11 @@
 
 </div>
 
+> [!NOTE]
+> 当前 GitHub 派生仓库为 [JustinKe02/so101_lerobot](https://github.com/JustinKe02/so101_lerobot)，
+> 仓库所有者为 [JustinKe02](https://github.com/JustinKe02)。项目基于
+> [Hugging Face LeRobot](https://github.com/huggingface/lerobot) 开发，上游版权、许可证和引用信息保持不变。
+
 **LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
 
 🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
@@ -36,6 +41,35 @@ lerobot-info
 
 > [!IMPORTANT]
 > For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
+
+## 本仓库的 SO-101 PI0.5 工作
+
+`main` 分支保留了当前稳定的 SO-101 PI0.5 训练与部署基础，主要包括：
+
+- SO-101 数据集训练策略、checkpoint 评估和多随机种子动作质量检查。
+- 同步推理与 RTC（Real-Time Chunking）真机 rollout，包括 actual-consumed 时序补偿。
+- 动作滤波、机器人侧相对目标限幅、stall guard 和推理失败后的资源清理。
+- PI0.5 TensorRT prefix 加速、PyTorch/TensorRT 一致性验证和性能分析。
+- SO-101 标定、相机、训练和上机过程的中文实验记录。
+
+VLASH future-state 异步推理仍位于独立开发分支
+[`codex/pi05-vlash`](https://github.com/JustinKe02/so101_lerobot/tree/codex/pi05-vlash)。该分支在
+`main` 的 PI0.5/RTC 基础上增加状态条件、temporal offset 训练、未来状态外推和固定 chunk
+切换。`main` 当前不包含 `--inference.type=vlash`，使用前请切换到对应分支。
+
+| 分支                                                                                    | 定位                                           | 主要推理模式     |
+| --------------------------------------------------------------------------------------- | ---------------------------------------------- | ---------------- |
+| [`main`](https://github.com/JustinKe02/so101_lerobot/tree/main)                         | 稳定的 SO-101 PI0.5 训练、RTC 与 TensorRT 基础 | Sync、RTC        |
+| [`codex/pi05-vlash`](https://github.com/JustinKe02/so101_lerobot/tree/codex/pi05-vlash) | 未来状态条件异步推理与真机抓取验证             | Sync、RTC、VLASH |
+
+相关文档：
+
+- [SO-101 PI0.5 训练策略](./PI05_SO101_TRAINING_STRATEGY.md)
+- [RTC 与 TensorRT 兼容计划](./PI05_TRT_RTC_COMPATIBILITY_PLAN.md)
+- [PI0.5 TensorRT 故障排查](./PI05_TENSORRT_TROUBLESHOOTING.md)
+- [TensorRT 视觉加速分析](./WHY_TENSORRT_ONLY_ACCELERATES_VISION.md)
+- [SO-101 PI0.5 阶段总结](./PI05_T1_DAILY_SUMMARY_20260726.md)
+- [VLASH 分支 README](https://github.com/JustinKe02/so101_lerobot/blob/codex/pi05-vlash/README.md)
 
 ## Robots & Control
 
