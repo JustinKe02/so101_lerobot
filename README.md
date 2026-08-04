@@ -15,6 +15,12 @@
 
 </div>
 
+> [!NOTE]
+> 当前 GitHub 派生仓库为 [JustinKe02/so101_lerobot](https://github.com/JustinKe02/so101_lerobot)，
+> 仓库所有者为 [JustinKe02](https://github.com/JustinKe02)。PI0.5 + VLASH 的当前开发分支是
+> [`codex/pi05-vlash`](https://github.com/JustinKe02/so101_lerobot/tree/codex/pi05-vlash)。项目基于
+> [Hugging Face LeRobot](https://github.com/huggingface/lerobot) 开发，上游版权、许可证和引用信息保持不变。
+
 **LeRobot** aims to provide models, datasets, and tools for real-world robotics in PyTorch. The goal is to lower the barrier to entry so that everyone can contribute to and benefit from shared datasets and pretrained models.
 
 🤗 A hardware-agnostic, Python-native interface that standardizes control across diverse platforms, from low-cost arms (SO-100) to humanoids.
@@ -37,12 +43,12 @@ lerobot-info
 > [!IMPORTANT]
 > For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
 
-## 当前分支：PI0.5 + VLASH SO-101 抓取
+## PI0.5 + VLASH SO-101 抓取
 
 本分支在 LeRobot PI0.5 上集成了受
 [MIT HAN Lab VLASH](https://github.com/mit-han-lab/vlash) 启发的异步推理链路，并完成了
 SO-101 双相机抓取任务的训练、离线回放和真机闭环验证。该实现为 LeRobot 原生后端，不依赖
-上游 VLASH 运行环境。
+上游 VLASH 运行环境。以下结果最后更新于 2026-08-04。
 
 主要改动包括：
 
@@ -54,17 +60,18 @@ SO-101 双相机抓取任务的训练、离线回放和真机闭环验证。该�
 
 ### 当前实验结果
 
-| 项目           | 结果                                                           |
-| -------------- | -------------------------------------------------------------- |
-| 数据集         | 40 episodes，17,960 帧，top + wrist 双相机，30 Hz              |
-| 数据划分       | 全部用于训练，无独立验证集                                     |
-| 训练           | 10 epochs，5,613 steps，batch size 32                          |
-| VLASH 训练配置 | `state_cond=true`，`temporal_offset_max_steps=8`               |
-| 最终训练 loss  | `0.012`，epoch 6 后逐渐进入平台期                              |
-| 真机推理配置   | 30 Hz，horizon 10，overlap 5，future-state delta 5.0           |
-| 60 秒真机控制  | 1,778 次动作反馈，约 29.6 Hz                                   |
-| 稳态推理时延   | P95 134.76 ms，最大 157.18 ms，deadline miss 0                 |
-| 当前效果       | 已完成物体接近、夹取和搬运的真机闭环验证，但速度与泛化仍需优化 |
+| 项目            | 结果                                                           |
+| --------------- | -------------------------------------------------------------- |
+| 数据集          | 40 episodes，17,960 帧，top + wrist 双相机，30 Hz              |
+| 数据划分        | 全部用于训练，无独立验证集                                     |
+| 第一阶段        | PI0.5 全参数任务适配，10 epochs，5,613 steps，学习率 2.5e-5    |
+| 第二阶段        | VLASH 专家分支微调，10 epochs，5,613 steps，学习率 5e-6        |
+| VLASH 训练配置  | `state_cond=true`，`temporal_offset_max_steps=8`               |
+| VLASH 最终 loss | `0.012`，epoch 6 后逐渐进入平台期                              |
+| 真机推理配置    | 30 Hz，horizon 10，overlap 5，future-state delta 5.0           |
+| 60 秒真机控制   | 1,778 次动作反馈，约 29.6 Hz                                   |
+| 稳态推理时延    | P95 134.76 ms，最大 157.18 ms，deadline miss 0                 |
+| 当前效果        | 已完成物体接近、夹取和搬运的真机闭环验证，但速度与泛化仍需优化 |
 
 RTC 与 VLASH 是两个可选推理后端，不会在当前链路中叠加运行。RTC 使用旧动作 prefix guidance
 和实际消耗步数融合新旧 chunk；VLASH 使用预测的未来状态生成下一完整 chunk，并在边界处整块
@@ -72,8 +79,9 @@ RTC 与 VLASH 是两个可选推理后端，不会在当前链路中叠加运行
 
 ### 训练与运行
 
-当前 SO-101 实验训练脚本提供 smoke 和完整 10-epoch 两种模式。脚本中的数据、基础权重和环境
-路径需要按实际机器调整：
+当前 SO-101 实验训练脚本执行的是第二阶段 VLASH 专家分支微调，并提供 smoke 和完整 10-epoch
+两种模式。运行前需要先准备第一阶段的全参数任务权重，并按实际机器调整脚本中的数据、基础权重和
+环境路径：
 
 ```bash
 bash src/lerobot/scripts/train_pi05_so101_vlash_10epochs.sh smoke
