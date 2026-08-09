@@ -354,6 +354,7 @@ class GrootConfig(PreTrainedConfig):
     # rejects unknown fields — and is then rejected with a clear N1.5 removal message rather than an
     # opaque draccus decoding error.
     image_size: tuple[int, int] = (256, 256)  # image sizing is handled by the backbone's image processor.
+    processor_model_path: str | None = None
     tokenizer_assets_repo: str | None = None
     lora_rank: int = 0
     lora_alpha: int = 16

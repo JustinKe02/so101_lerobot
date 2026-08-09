@@ -33,10 +33,13 @@ import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from huggingface_hub.errors import HfHubHTTPError
+from safetensors import safe_open
+from safetensors.torch import load_model as load_model_as_safetensor
 from torch import Tensor
 
 from lerobot.configs import FeatureType, PolicyFeature
 from lerobot.utils.constants import ACTION, OBS_IMAGES
+from lerobot.utils.device_utils import resolve_safetensors_device
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 from ..pretrained import PreTrainedPolicy
@@ -60,6 +63,12 @@ else:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="GrootPolicy")
+
+_QWEN_LM_HEAD_WEIGHT = "_groot_model.backbone.model.lm_head.weight"
+_QWEN_EMBED_TOKENS_WEIGHT = (
+    "_groot_model.backbone.model.model.language_model.embed_tokens.weight"
+)
+_TIED_WEIGHT_COMPARE_ROWS = 4096
 
 
 class GrootPolicy(PreTrainedPolicy):
@@ -119,6 +128,58 @@ class GrootPolicy(PreTrainedPolicy):
         for parameter in model.parameters():
             if parameter.is_floating_point():
                 parameter.data = parameter.data.to(torch.float32)
+
+    @staticmethod
+    def _checkpoint_has_redundant_qwen_embedding(model_file: str) -> bool:
+        """Return whether the Transformers-layout embedding alias exactly matches the saved LM head."""
+        with safe_open(model_file, framework="pt", device="cpu") as checkpoint:
+            keys = set(checkpoint.keys())
+            if not {_QWEN_LM_HEAD_WEIGHT, _QWEN_EMBED_TOKENS_WEIGHT}.issubset(keys):
+                return False
+
+            lm_head = checkpoint.get_slice(_QWEN_LM_HEAD_WEIGHT)
+            embed_tokens = checkpoint.get_slice(_QWEN_EMBED_TOKENS_WEIGHT)
+            lm_head_shape = tuple(lm_head.get_shape())
+            if len(lm_head_shape) != 2 or lm_head_shape != tuple(embed_tokens.get_shape()):
+                return False
+
+            for start in range(0, lm_head_shape[0], _TIED_WEIGHT_COMPARE_ROWS):
+                end = min(start + _TIED_WEIGHT_COMPARE_ROWS, lm_head_shape[0])
+                if not torch.equal(lm_head[start:end], embed_tokens[start:end]):
+                    return False
+        return True
+
+    @classmethod
+    def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:
+        if not strict:
+            return super()._load_as_safetensor(model, model_file, map_location, strict=False)
+
+        missing_keys, unexpected_keys = load_model_as_safetensor(
+            model,
+            model_file,
+            strict=False,
+            device=resolve_safetensors_device(map_location),
+        )
+        missing_keys = set(missing_keys)
+        unexpected_keys = set(unexpected_keys)
+
+        if _QWEN_EMBED_TOKENS_WEIGHT in unexpected_keys and cls._checkpoint_has_redundant_qwen_embedding(
+            model_file
+        ):
+            unexpected_keys.remove(_QWEN_EMBED_TOKENS_WEIGHT)
+            logger.info("Ignored an exact duplicate Qwen input-embedding alias in the checkpoint")
+
+        if missing_keys or unexpected_keys:
+            error = f"Error(s) in loading state_dict for {model.__class__.__name__}:"
+            if missing_keys:
+                keys = ", ".join(f'"{key}"' for key in sorted(missing_keys))
+                error += f"\n    Missing key(s) in state_dict: {keys}"
+            if unexpected_keys:
+                keys = ", ".join(f'"{key}"' for key in sorted(unexpected_keys))
+                error += f"\n    Unexpected key(s) in state_dict: {keys}"
+            raise RuntimeError(error)
+
+        return model
 
     @staticmethod
     def _build_weight_decay_parameter_groups(model: torch.nn.Module) -> list[dict[str, object]]:

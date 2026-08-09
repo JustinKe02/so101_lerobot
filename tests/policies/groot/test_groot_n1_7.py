@@ -23,7 +23,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from lerobot.configs import FeatureType, PolicyFeature
@@ -556,6 +556,61 @@ def test_groot_from_pretrained_keeps_matching_caller_config(tmp_path, monkeypatc
     policy = GrootPolicy.from_pretrained(model_path, config=config)
 
     assert policy.config.base_model_path == str(model_path)
+
+
+def test_groot_config_accepts_deprecated_processor_model_path():
+    input_features, output_features = _groot_features(state_dim=8, action_dim=7)
+    config = GrootConfig(
+        input_features=input_features,
+        output_features=output_features,
+        device="cpu",
+        use_bf16=False,
+        processor_model_path="Qwen/Qwen3-VL-2B-Instruct",
+    )
+
+    assert config.processor_model_path == "Qwen/Qwen3-VL-2B-Instruct"
+
+
+def test_groot_strict_load_accepts_identical_qwen_embedding_alias(tmp_path):
+    model = nn.Module()
+    model._groot_model = nn.Module()
+    model._groot_model.backbone = nn.Module()
+    model._groot_model.backbone.model = nn.Module()
+    model._groot_model.backbone.model.lm_head = nn.Linear(3, 5, bias=False)
+    expected = torch.arange(15, dtype=torch.float32).view(5, 3)
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "_groot_model.backbone.model.lm_head.weight": expected,
+            "_groot_model.backbone.model.model.language_model.embed_tokens.weight": expected.clone(),
+        },
+        checkpoint,
+    )
+
+    loaded = GrootPolicy._load_as_safetensor(model, str(checkpoint), "cpu", strict=True)
+
+    assert loaded is model
+    torch.testing.assert_close(model._groot_model.backbone.model.lm_head.weight, expected)
+
+
+def test_groot_strict_load_rejects_different_qwen_embedding_alias(tmp_path):
+    model = nn.Module()
+    model._groot_model = nn.Module()
+    model._groot_model.backbone = nn.Module()
+    model._groot_model.backbone.model = nn.Module()
+    model._groot_model.backbone.model.lm_head = nn.Linear(3, 5, bias=False)
+    expected = torch.arange(15, dtype=torch.float32).view(5, 3)
+    checkpoint = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "_groot_model.backbone.model.lm_head.weight": expected,
+            "_groot_model.backbone.model.model.language_model.embed_tokens.weight": expected + 1,
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(RuntimeError, match="Unexpected key.*embed_tokens.weight"):
+        GrootPolicy._load_as_safetensor(model, str(checkpoint), "cpu", strict=True)
 
 
 def test_groot_from_pretrained_infers_n1_7_from_ambiguous_local_config(tmp_path, monkeypatch):
