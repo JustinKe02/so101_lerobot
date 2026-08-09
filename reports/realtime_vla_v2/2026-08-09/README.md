@@ -1,5 +1,9 @@
 # 2026-08-09 Realtime-VLA V2 中文报告归档
 
+> 状态说明：本归档记录的是 RTC6 training-RTC、Triton 推理和部分 Realtime-VLA V2 运行组件
+> 的集成结果，不代表完整论文级运行栈已经启用。动态 action-prefill、实测传感器与电机标定、
+> 固定心跳 Realtime Executor 和 Speed Adapter 在归档会话中均未完整启用。
+
 本目录只保存面向人员阅读的中文报告内容：
 
 - `training_summary.json`：RTC6 完整训练与 RTC15 主动停止训练的中文结构化摘要。
@@ -21,4 +25,5 @@
 
 机器日志默认显示 `overall_pass=false`，主要原因是每次运行启动时有一次空队列事件，以及论文级
 标定功能被有意关闭。判断运行是否正常时，应结合 `terminal.status` 和各项子检查；日报已用中文
-给出解释。
+给出解释。Triton 延迟降低只代表模型推理加速，不应解释为完整 Realtime-VLA V2 已经实现或
+任务速度已经获得论文中的同等提升。

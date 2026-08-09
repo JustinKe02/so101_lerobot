@@ -42,9 +42,9 @@ lerobot-info
 > [!IMPORTANT]
 > For detailed installation guide, please see the [Installation Documentation](https://huggingface.co/docs/lerobot/installation).
 
-## 本仓库的 SO-101 PI0.5 工作
+## 本仓库的 SO-101 模型工作
 
-`main` 分支保留了当前稳定的 SO-101 PI0.5 训练与部署基础，主要包括：
+`main` 分支作为稳定入口，保留 SO-101 训练、标定和基础部署能力，主要包括：
 
 - SO-101 数据集训练策略、checkpoint 评估和多随机种子动作质量检查。
 - 同步推理与 RTC（Real-Time Chunking）真机 rollout，包括 actual-consumed 时序补偿。
@@ -52,15 +52,32 @@ lerobot-info
 - PI0.5 TensorRT prefix 加速、PyTorch/TensorRT 一致性验证和性能分析。
 - SO-101 标定、相机、训练和上机过程的中文实验记录。
 
-VLASH future-state 异步推理仍位于独立开发分支
-[`codex/pi05-vlash`](https://github.com/JustinKe02/so101_lerobot/tree/codex/pi05-vlash)。该分支在
-`main` 的 PI0.5/RTC 基础上增加状态条件、temporal offset 训练、未来状态外推和固定 chunk
-切换。`main` 当前不包含 `--inference.type=vlash`，使用前请切换到对应分支。
+较新的模型和推理框架在独立分支开发，避免实验代码直接影响 `main` 的稳定使用：
 
-| 分支                                                                                    | 定位                                           | 主要推理模式     |
-| --------------------------------------------------------------------------------------- | ---------------------------------------------- | ---------------- |
-| [`main`](https://github.com/JustinKe02/so101_lerobot/tree/main)                         | 稳定的 SO-101 PI0.5 训练、RTC 与 TensorRT 基础 | Sync、RTC        |
-| [`codex/pi05-vlash`](https://github.com/JustinKe02/so101_lerobot/tree/codex/pi05-vlash) | 未来状态条件异步推理与真机抓取验证             | Sync、RTC、VLASH |
+| 分支 | 定位 | 当前状态 |
+| --- | --- | --- |
+| [`main`](https://github.com/JustinKe02/so101_lerobot/tree/main) | 稳定的 SO-101 PI0.5、RTC 与 TensorRT 基础 | 稳定入口 |
+| [`pi05-vlash`](https://github.com/JustinKe02/so101_lerobot/tree/pi05-vlash) | 未来状态条件、temporal offset 与 VLASH 异步推理 | 已完成训练和真机对比 |
+| [`realtime-vla-v2`](https://github.com/JustinKe02/so101_lerobot/tree/realtime-vla-v2) | RTC 训练前缀、全模型 Triton、延迟对齐队列和时间轴规划 | SO-101 适配开发分支 |
+| [`groot-n1.7-inference`](https://github.com/JustinKe02/so101_lerobot/tree/groot-n1.7-inference) | GR00T N1.7 checkpoint 加载与 SO-101 rollout 接入 | 独立推理验证分支 |
+
+### Realtime-VLA V2 当前定位
+
+`realtime-vla-v2` 已完成 RTC6 全量解冻训练、trained-prefix 推理、actual-consumed 队列、
+时间轴规划器和完整 PI0.5 Triton 后端。Triton 将相同 RTC6 权重的平均推理延迟从约
+`136-138 ms` 降至 `45-49 ms`，它是模型推理加速后端，不是电机执行后端，也不单独构成
+Realtime-VLA V2。
+
+当前推荐配置仍关闭以下论文级运行组件，因此应描述为“Realtime-VLA V2 的 SO-101 部分适配”，
+不能描述为完整论文级实现：
+
+- 基于实测传感器延迟的动态 action-prefill。
+- 带校验和的关节速度、加速度约束标定。
+- 带电机响应标定的固定心跳 Realtime Executor。
+- 经过人工标注训练的 Speed Adapter。
+
+是否需要扩展 RTC6 权重，必须先完成真实延迟标定。只有实测动态前缀稳定超过 6 步时才需要按
+实际容量重新训练，不应直接把一次基于固定估计值的 7 步结果当作 RTC15 训练依据。
 
 相关文档：
 
@@ -69,7 +86,9 @@ VLASH future-state 异步推理仍位于独立开发分支
 - [PI0.5 TensorRT 故障排查](./PI05_TENSORRT_TROUBLESHOOTING.md)
 - [TensorRT 视觉加速分析](./WHY_TENSORRT_ONLY_ACCELERATES_VISION.md)
 - [SO-101 PI0.5 阶段总结](./PI05_T1_DAILY_SUMMARY_20260726.md)
-- [VLASH 分支 README](https://github.com/JustinKe02/so101_lerobot/blob/codex/pi05-vlash/README.md)
+- [VLASH 分支 README](https://github.com/JustinKe02/so101_lerobot/blob/pi05-vlash/README.md)
+- [Realtime-VLA V2 SO-101 适配说明](./REALTIME_VLA_V2_SO101_ADAPTATION.md)
+- [Realtime-VLA V2 中文训练与上机报告](./REALTIME_VLA_V2_DAILY_REPORT_20260809.md)
 
 ## Robots & Control
 

@@ -68,6 +68,25 @@ SO101Follower command dispatch
 
 ## Current Implementation Status
 
+### Deployment status correction
+
+The branch contains code paths for the adapted runtime, but the recommended
+August 9 robot configuration does not enable the complete stack. It enables
+RTC6 trained-prefix inference, actual-consumed queue alignment, the time-axis
+planner, Triton inference, and schema-v2 tracing. Dynamic prefill, measured
+sensor timing, checksum-pinned joint constraints, the calibrated fixed-heartbeat
+executor, and the trained speed adapter remain disabled or unavailable.
+
+Triton replaces the PI0.5 model inference backend; it does not replace the
+SO-101 motor command backend and is not itself a Realtime-VLA V2 algorithmic
+feature. The current deployment must therefore be described as a partial
+SO-101 adaptation, not as a paper-ready implementation.
+
+The earlier seven-step dynamic-prefill result used uncalibrated delay constants.
+It does not justify RTC15 training. Measure the real sensor and actuator timing
+first, keep the RTC6 checkpoint if the resulting prefix fits its capacity, and
+only retrain to the smallest measured capacity plus margin if it does not.
+
 The first training/inference compatibility slice is now implemented in the
 LeRobot runtime:
 

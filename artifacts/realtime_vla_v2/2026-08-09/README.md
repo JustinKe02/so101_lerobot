@@ -1,5 +1,9 @@
 # 2026-08-09 Realtime-VLA V2 机器日志说明
 
+这些文件证明 RTC6 权重、trained-prefix、队列调度和 Triton 后端的对应会话结果，但不证明
+动态 action-prefill、实测动力学约束、标定 Realtime Executor 或 Speed Adapter 已经启用。
+Triton 是 PI0.5 模型推理后端，不是机器人电机执行后端。
+
 本目录保存由校验工具生成的机器可读日志。JSON 字段名、枚举值和检查描述属于固定数据格式，
 为了保持分析器兼容性不做翻译；对应的中文结论请查看：
 
