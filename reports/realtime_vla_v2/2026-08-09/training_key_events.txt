@@ -1,17 +1,17 @@
-RTC6 FULL UNFREEZE
-started_at=2026-08-08T17:00:52+08:00
-status=completed
-exit_code=0
-INFO 2026-08-09 00:47:07 ot_train.py:624 step:6K smpl:180K ep:400 epch:10.00 loss:0.009 grdn:0.281 lr:2.5e-06 updt_s:4.969 data_s:0.007 smp/s:6 mem_gb:39.55
-INFO 2026-08-09 00:47:17 ot_train.py:670 Checkpoint policy after step 5612
-INFO 2026-08-09 00:48:23 ot_train.py:670 Checkpoint policy after step 5613
-INFO 2026-08-09 00:50:50 ot_train.py:756 End of training
-finished_at=2026-08-09T00:50:52+08:00
+RTC6 全量解冻训练
+开始时间=2026-08-08T17:00:52+08:00
+状态=已完成
+退出码=0
+原始日志：INFO 2026-08-09 00:47:07 ot_train.py:624 step:6K smpl:180K ep:400 epch:10.00 loss:0.009 grdn:0.281 lr:2.5e-06 updt_s:4.969 data_s:0.007 smp/s:6 mem_gb:39.55
+原始日志：INFO 2026-08-09 00:47:17 ot_train.py:670 Checkpoint policy after step 5612
+原始日志：INFO 2026-08-09 00:48:23 ot_train.py:670 Checkpoint policy after step 5613
+原始日志：INFO 2026-08-09 00:50:50 ot_train.py:756 End of training
+结束时间=2026-08-09T00:50:52+08:00
 
-RTC15 FULL UNFREEZE EXPLORATION
-started_at=2026-08-09T13:23:29+08:00
-status=stopped_by_user
-exit_code=130
-INFO 2026-08-09 14:17:39 ot_train.py:624 step:590 smpl:19K ep:42 epch:1.05 loss:0.041 grdn:0.484 lr:2.4e-05 updt_s:4.959 data_s:0.006 smp/s:6 mem_gb:39.55
-stop_reason=Stopped by user to release GPU memory for RTC6 Realtime-VLA V2 validation.
-finished_at=2026-08-09T14:18:09+08:00
+RTC15 全量解冻探索训练
+开始时间=2026-08-09T13:23:29+08:00
+状态=用户主动停止
+退出码=130
+原始日志：INFO 2026-08-09 14:17:39 ot_train.py:624 step:590 smpl:19K ep:42 epch:1.05 loss:0.041 grdn:0.484 lr:2.4e-05 updt_s:4.959 data_s:0.006 smp/s:6 mem_gb:39.55
+停止原因=为 RTC6 Realtime-VLA V2 验证释放 GPU 显存，按用户要求停止。
+结束时间=2026-08-09T14:18:09+08:00

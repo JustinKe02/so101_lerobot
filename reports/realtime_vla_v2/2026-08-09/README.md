@@ -1,24 +1,24 @@
-# Realtime-VLA V2 reports for 2026-08-09
+# 2026-08-09 Realtime-VLA V2 中文报告归档
 
-This directory contains compact, reviewable evidence derived from today's local
-training and robot rollout logs.
+本目录只保存面向人员阅读的中文报告内容：
 
-- `training_summary.json`: RTC6 completed run and intentionally stopped RTC15 run.
-- `training_key_events.txt`: selected original training status and metric lines.
-- `raw_artifacts.sha256`: hashes and local sizes for raw logs and traces.
-- `triton_parity_rtc6.json`: fixed-noise PyTorch/Triton parity for prefix lengths 0-6.
-- `trace_rtc6_triton_all.json`: five Triton integration sessions, including three
-  fail-closed debugging sessions and two completed sessions.
-- `trace_triton_direct_no_time_axis.json`: direct Triton, fixed prefix 5, planner off.
-- `trace_pytorch_direct_prefix5.json`: two direct PyTorch sessions.
-- `trace_triton_direct_rolling_p95.json`: direct Triton, planner on, rolling-P95 prefix.
+- `training_summary.json`：RTC6 完整训练与 RTC15 主动停止训练的中文结构化摘要。
+- `training_key_events.txt`：训练开始、结束、损失和权重保存等关键事件。
+- 仓库根目录的 `REALTIME_VLA_V2_DAILY_REPORT_20260809.md`：当天训练、推理和上机结论。
 
-The raw JSONL traces total more than 180 MB and are excluded by `.gitignore`. They
-remain under `outputs/traces/`; the SHA-256 manifest binds these reports to those
-exact source files. Model checkpoints, optimizer state, and the 6.7 GB Triton export
-are also intentionally not stored in Git.
+校验器输出采用固定英文数据格式，不能翻译字段名，否则会破坏后续工具读取。这些文件已移动到
+`artifacts/realtime_vla_v2/2026-08-09/`，作为机器日志而不是面向人员的报告：
 
-The trace validator's default acceptance result is false for these ablations because
-of one startup empty-queue event per session and intentionally disabled paper-level
-calibration features. Check `terminal.status` and the individual checks when
-distinguishing a completed run from an integration failure.
+- `triton_parity_rtc6.json`：0-6 步前缀的 PyTorch/Triton 固定噪声一致性结果。
+- `trace_rtc6_triton_all.json`：5 次 Triton 集成运行，包含 3 次故障关闭调试和 2 次正常完成。
+- `trace_triton_direct_no_time_axis.json`：Triton 直出、固定前缀 5、关闭规划器。
+- `trace_pytorch_direct_prefix5.json`：两次 PyTorch 直出运行。
+- `trace_triton_direct_rolling_p95.json`：Triton 直出、启用规划器、滚动 P95 前缀。
+- `raw_artifacts.sha256`：本机原始日志和轨迹的文件大小及 SHA-256。
+
+原始 JSONL 轨迹合计超过 180 MB，继续保存在本机 `outputs/traces/`，不直接进入 Git。模型
+权重、优化器状态和 6.7 GB 的 Triton 导出也不提交到代码仓库。
+
+机器日志默认显示 `overall_pass=false`，主要原因是每次运行启动时有一次空队列事件，以及论文级
+标定功能被有意关闭。判断运行是否正常时，应结合 `terminal.status` 和各项子检查；日报已用中文
+给出解释。

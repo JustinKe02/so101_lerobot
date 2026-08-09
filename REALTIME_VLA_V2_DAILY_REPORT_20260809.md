@@ -1,99 +1,91 @@
-# PI0.5 Realtime-VLA V2 training and rollout report (2026-08-09)
+# PI0.5 Realtime-VLA V2 训练与上机报告（2026-08-09）
 
-## Outcome
+## 今日结论
 
-The 40-episode PI0.5 RTC6 full-unfreeze run completed successfully and produced the
-checkpoint used for today's robot rollouts. The complete Realtime-VLA V2 runtime,
-Triton backend, calibration tools, parity gates, trace validator, configs, and tests
-were committed as `6c3860cc` on `realtime-vla-v2`.
+基于 40 条回合数据的 PI0.5 RTC6 全量解冻训练已顺利完成，并产出今天所有上机验证所使用的
+权重。完整的 Realtime-VLA V2 运行时、Triton 后端、标定工具、一致性门禁、轨迹日志分析器、
+配置和测试，已通过提交 `6c3860cc` 合入 `realtime-vla-v2` 分支。
 
-Triton is the preferred deployment backend. It preserved approximately the same
-observed task behavior as PyTorch while reducing mean full-model inference latency
-from `136-138 ms` to `45-49 ms`. Disabling the time-axis planner or changing fixed
-prefix length 5 to rolling-P95 did not produce an obvious task-quality improvement
-in the supervised runs. The remaining quality gap is therefore more likely to be
-model/data or physical actuator tracking than the inference backend.
+当前推荐使用 Triton 作为部署后端。它与 PyTorch 的实际上机效果接近，但把完整模型的平均推理
+延迟从 `136-138 ms` 降低到 `45-49 ms`。关闭时间轴规划器，或者把固定 5 步前缀改为滚动
+P95 前缀，都没有带来明显的任务效果提升。因此，当前剩余的效果差距更可能来自模型权重、训练
+数据或电机跟踪，而不是推理后端。
 
-## Training
+## 训练情况
 
-| Run | Result | Progress | Time | Final loss | Last-10 mean loss | Peak GPU memory |
+| 训练任务 | 状态 | 进度 | 用时 | 最终损失 | 最后 10 次平均损失 | 峰值显存 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| RTC6 full unfreeze | Completed | 5613 steps, 10.00 epochs | 7 h 50 min | 0.009 | 0.0091 | 39.55 GB |
-| RTC15 full unfreeze | Stopped intentionally | 596/5613 steps, 1.05 epochs | 54 min 40 s | 0.041 at step 590 | 0.0473 | 39.55 GB |
+| RTC6 全量解冻 | 已完成 | 5613 步，10.00 轮 | 7 小时 50 分 | 0.009 | 0.0091 | 39.55 GB |
+| RTC15 全量解冻 | 主动停止 | 596/5613 步，1.05 轮 | 54 分 40 秒 | 第 590 步为 0.041 | 0.0473 | 39.55 GB |
 
-RTC6 configuration:
+RTC6 训练配置如下：
 
-- Dataset: `admin123/so101_test_data`, 40 episodes, no evaluation split.
-- Full unfreeze: `freeze_vision_encoder=false`, `train_expert_only=false`.
-- Training RTC capacity: `rtc_training_max_delay=6`.
-- Batch size 32, BF16, gradient checkpointing, seed 1000.
-- Approximately 180K samples were processed at 4.96 seconds/update.
-- Checkpoints were saved at steps 2806, 5612, and final step 5613.
-- Final checkpoint: `outputs/train/pi05_so101_realtime_vla_v2_full_10epochs_rtc6_seed1000/checkpoints/005613/pretrained_model`.
+- 数据集：`admin123/so101_test_data`，共 40 条回合数据，不划分验证集。
+- 全量解冻：`freeze_vision_encoder=false`、`train_expert_only=false`。
+- 训练时 RTC 容量：`rtc_training_max_delay=6`。
+- 批量大小 32，BF16，开启梯度检查点，随机种子 1000。
+- 共处理约 18 万个样本，平均每次更新约 4.96 秒。
+- 在第 2806、5612 和最终第 5613 步保存权重。
+- 最终权重路径：`outputs/train/pi05_so101_realtime_vla_v2_full_10epochs_rtc6_seed1000/checkpoints/005613/pretrained_model`。
 
-RTC15 was an exploratory capacity-extension run. It was stopped by the user to
-release GPU memory for RTC6 validation before reaching the first checkpoint, so it
-did not replace the completed RTC6 checkpoint.
+RTC15 是用于扩大前缀容量的探索性训练。为了释放显存并继续验证 RTC6，用户在其到达第一个
+保存点前主动停止，因此 RTC15 没有产出可替代 RTC6 的有效权重。
 
-## Export and parity
+## Triton 导出与一致性
 
-The RTC6 checkpoint was exported to the static BF16 Triton layout. The export SHA-256
-is `8bb1dcd1e44e035c8a473863a0633cbc8cc63d4946d9a5d41e226080bf7dc088`.
+RTC6 权重已经导出为静态 BF16 Triton 布局，导出文件的 SHA-256 为
+`8bb1dcd1e44e035c8a473863a0633cbc8cc63d4946d9a5d41e226080bf7dc088`。
 
-Fixed-noise parity passed for every trained prefix length from 0 through 6. The worst
-reported normalized max absolute error was `0.04940`; at prefix length 5 it was
-`0.02236` with mean absolute error `0.00586`.
+固定噪声一致性验证覆盖训练支持的 0-6 步全部前缀，结果全部通过。所有前缀中的最大归一化
+绝对误差为 `0.04940`；前缀长度为 5 时，最大绝对误差为 `0.02236`，平均绝对误差为
+`0.00586`。
 
-## Robot rollout comparison
+## 上机推理对比
 
-All latency values below cover complete image encoder, VLM, action expert, and ten
-denoising steps. Completed sessions ended through the normal cleanup path.
+下表延迟均覆盖完整图像编码器、视觉语言模型、动作专家和 10 步去噪。标记为“正常完成”的
+运行均经过正常清理流程退出。
 
-| Variant | Sessions | Mean latency | P95 latency | Max latency | Queue minimum | Result |
+| 推理方案 | 运行次数 | 平均延迟 | P95 延迟 | 最大延迟 | 队列最小值 | 结果 |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Triton + uncalibrated Executor + rolling-P95 | 1 | 47.64 ms | 58.36 ms | 84.29 ms | 48 | Completed; executor altered model commands |
-| Triton direct + planner + fixed prefix 5 | 1 | 47.51 ms | 57.77 ms | 85.08 ms | 48 | Completed; model command was sent directly |
-| Triton direct + no planner + fixed prefix 5 | 1 | 45.15 ms | 57.94 ms | 88.29 ms | 48 | Completed; task effect similar, higher peak dynamics |
-| PyTorch direct + no planner + fixed prefix 5 | 2 | 136-138 ms | 144-145 ms | 397-418 ms | 45 | Completed; task effect similar, approximately 3x slower |
-| Triton direct + planner + rolling-P95 | 1 | 48.65 ms | 57.85 ms | 73.65 ms | 48 | Completed; task effect similar |
+| Triton + 未标定执行器 + 滚动 P95 | 1 | 47.64 ms | 58.36 ms | 84.29 ms | 48 | 正常完成，但执行器改写了模型动作 |
+| Triton 直出 + 规划器 + 固定前缀 5 | 1 | 47.51 ms | 57.77 ms | 85.08 ms | 48 | 正常完成，模型动作直接下发 |
+| Triton 直出 + 关闭规划器 + 固定前缀 5 | 1 | 45.15 ms | 57.94 ms | 88.29 ms | 48 | 正常完成，任务效果接近但峰值动态更高 |
+| PyTorch 直出 + 关闭规划器 + 固定前缀 5 | 2 | 136-138 ms | 144-145 ms | 397-418 ms | 45 | 正常完成，任务效果接近但慢约 3 倍 |
+| Triton 直出 + 规划器 + 滚动 P95 | 1 | 48.65 ms | 57.85 ms | 73.65 ms | 48 | 正常完成，任务效果接近 |
 
-The direct variants produced zero difference between the selected model action and
-the dispatched command. PyTorch consumed mostly 3-4 control actions during each
-inference; Triton normally consumed 1-2, leaving more feedback and queue headroom.
+所有直出方案中，模型选中的动作与实际下发命令之间的差值均为 0。PyTorch 每次推理通常会
+消耗 3-4 个控制动作，Triton 通常只消耗 1-2 个，因此 Triton 留出了更多反馈和队列余量。
 
-Three early integration sessions ended abnormally and are retained in the report:
+报告也保留了三次早期集成失败：
 
-1. The uncalibrated executor repeatedly rewrote goals after the arm failed to track
-   shoulder/elbow targets, triggering the consecutive safety-clamp stop.
-2. Full dynamic prefill required 7 steps, exceeding the RTC6 checkpoint capacity.
-3. A sub-microsecond floating-point scheduler regression was rejected as backwards
-   time. Later sessions used the corrected scheduler path.
+1. 未标定执行器在机械臂无法跟踪肩部和肘部目标后连续改写命令，触发安全停止。
+2. 完整动态预填充需要 7 步，超过 RTC6 权重的 6 步容量。
+3. 浮点时间戳出现亚微秒级回退，调度器按故障关闭原则拒绝继续运行；后续运行已使用修正后的
+   调度路径。
 
-## Interpretation
+## 分析结论
 
-- Triton is a faithful acceleration path, not a different trained model. It uses the
-  same RTC6 weights, 50-action chunk, and ten Euler denoising steps.
-- Time-axis planning was not the primary source of the observed task-quality gap.
-- The uncalibrated Realtime Executor should remain disabled for current robot use.
-- Fixed prefix 5 and rolling-P95 produced similar supervised task behavior. More
-  repeated trials with task-success labels are required before claiming a success-rate
-  difference.
-- Trace acceptance reports show `overall_pass=false` because each rollout records one
-  startup empty-queue event and because paper-level calibration/speed-adapter features
-  are intentionally disabled. This is not a runtime exception; selected sessions have
-  `terminal.status=completed`.
+- Triton 是同一模型的高保真加速后端，并不是另一套训练权重；两者使用相同的 RTC6 权重、
+  50 步动作块和 10 次欧拉去噪。
+- 时间轴规划不是当前任务效果差距的主要来源。
+- 实时执行器（Realtime Executor）尚未完成 SO-101 实机标定，当前应保持关闭。
+- 固定 5 步前缀与滚动 P95 前缀的上机效果接近。若要判断任务成功率差异，需要在相同初始
+  条件下进行更多重复试验并记录成功标签。
+- 轨迹验收日志中的 `overall_pass=false`，来自每次启动时的一次空队列事件，以及论文级标定、
+  速度适配等功能被有意关闭；这不等同于运行异常。选定上机会话的
+  `terminal.status=completed`。
 
-## Recommended current configuration
+## 当前推荐配置
 
-Use `pi05_realtime_vla_v2_40ep_rtc6_triton_direct_rolling_p95.json`. It keeps the
-completed RTC6 weights and Triton backend, disables the uncalibrated executor and
-action filter, keeps the time-axis planner, and adapts prefix length to rolling P95
-latency. The configuration intentionally retains the previously requested unlimited
-relative target setting (`max_relative_target=null`); supervised operation and an
-accessible emergency stop remain required.
+推荐使用 `pi05_realtime_vla_v2_40ep_rtc6_triton_direct_rolling_p95.json`。该配置继续使用
+已完成的 RTC6 权重和 Triton 后端，关闭未标定执行器与动作滤波，保留时间轴规划器，并根据
+滚动 P95 延迟自动调整前缀长度。
 
-## Archived reports
+该配置按此前要求保留 `max_relative_target=null`，即不启用软件相对目标限幅。上机时必须由
+人员现场监督，并确保急停可随时触发。
 
-Compact, reviewable logs are under `reports/realtime_vla_v2/2026-08-09/`. Raw traces,
-checkpoints, optimizer state, and the multi-gigabyte Triton export remain under local
-`outputs/` and are identified by SHA-256 in the manifest rather than committed to Git.
+## 归档内容
+
+中文报告位于 `reports/realtime_vla_v2/2026-08-09/`。校验器固定格式的机器日志位于
+`artifacts/realtime_vla_v2/2026-08-09/`。原始轨迹、权重、优化器状态和数 GB 的 Triton 导出
+仍保存在本机 `outputs/` 下，不直接提交到 Git；机器日志中的 SHA-256 清单可以核对原始文件。
