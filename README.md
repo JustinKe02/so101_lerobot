@@ -63,6 +63,29 @@ lerobot-info
 | [`realtime-vla-v2`](https://github.com/JustinKe02/so101_lerobot/tree/realtime-vla-v2) | RTC 训练前缀、全模型 Triton、延迟对齐队列和时间轴规划 | 当前主要实时推理分支 |
 | [`groot-n1.7-inference`](https://github.com/JustinKe02/so101_lerobot/tree/groot-n1.7-inference) | GR00T N1.7 checkpoint 加载与 SO-101 rollout 接入 | 独立推理验证分支 |
 
+### ACT 20k 训练与真机推理基线
+
+本仓库保留了一套已经完成训练和两轮真机推理验证的 ACT 基线：
+
+- 数据集：`admin123/so101_test_data`，40 个 episode，共 17,960 帧，30 FPS。
+- 任务：`Put the block in the bin`，使用 `top` 和 `wrist` 两路 640 x 480 图像。
+- 模型：ACT，`chunk_size=100`、`n_action_steps=100`、条件 VAE，约 5160 万参数。
+- 初始化：没有加载预训练 ACT 检查点（`pretrained_path=null`），仅使用 ImageNet 预训练
+  ResNet18 初始化视觉骨干。
+- 训练范围：全部 51,597,190 个参数均参与训练，其中 ResNet18 骨干的 11,166,912 个参数
+  没有冻结；未使用 LoRA、Adapter 或其他 PEFT 方法。
+- 优化配置：AdamW，主体和视觉骨干学习率均为 `1e-5`，weight decay 为 `1e-4`，
+  batch size 为 8。
+- 训练时长：20,000 step，约 8.9 epoch，每 5,000 step 保存一次检查点。
+- 最终指标：`loss=0.119`、`l1_loss=0.105`、`kld_loss=0.001`。
+- 最终模型：`outputs/train/act_so101_test_data_20k/checkpoints/020000/pretrained_model`，
+  `model.safetensors` 约 207 MB，继续保存在本机，不提交到 Git。
+
+真机推理采用 `lerobot-rollout` 同步后端。第一轮每 10 步强制重规划，产生了明显的周期性卡顿；
+第二轮改为 `policy.n_action_steps=50` 并移除强制重规划，最终
+`horizon_replans=0`、`clamp_replans=0`。完整时序、延迟和动作块分析见
+[ACT 两轮真机推理日志报告](https://github.com/JustinKe02/so101_lerobot/blob/act-infer/ACT_INFERENCE_LOG_REPORT.md)。
+
 ### Realtime-VLA V2 最新结果
 
 `realtime-vla-v2` 分支已经完成基于 40 条回合数据的 PI0.5 RTC6 全量解冻训练：
