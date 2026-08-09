@@ -50,6 +50,7 @@ lerobot-info
 - 同步推理与 RTC（Real-Time Chunking）真机 rollout，包括 actual-consumed 时序补偿。
 - 动作滤波、机器人侧相对目标限幅、stall guard 和推理失败后的资源清理。
 - PI0.5 TensorRT prefix 加速、PyTorch/TensorRT 一致性验证和性能分析。
+- LeRobotDataset 非流式批量视频编码支持连续多个 batch，并在 finalize 时完整回填视频元数据。
 - SO-101 标定、相机、训练和上机过程的中文实验记录。
 
 较新的模型和推理框架在独立分支开发，避免实验代码直接影响 `main` 的稳定使用：
@@ -57,6 +58,7 @@ lerobot-info
 | 分支 | 定位 | 当前状态 |
 | --- | --- | --- |
 | [`main`](https://github.com/JustinKe02/so101_lerobot/tree/main) | 稳定的 SO-101 PI0.5、RTC 与 TensorRT 基础 | 稳定入口 |
+| [`act-infer`](https://github.com/JustinKe02/so101_lerobot/tree/act-infer) | ACT 20k 检查点真机同步推理、控制频率与动作块卡顿分析 | 已完成两轮真机对比 |
 | [`pi05-vlash`](https://github.com/JustinKe02/so101_lerobot/tree/pi05-vlash) | 未来状态条件、temporal offset 与 VLASH 异步推理 | 已完成训练和真机对比 |
 | [`realtime-vla-v2`](https://github.com/JustinKe02/so101_lerobot/tree/realtime-vla-v2) | RTC 训练前缀、全模型 Triton、延迟对齐队列和时间轴规划 | 当前主要实时推理分支 |
 | [`groot-n1.7-inference`](https://github.com/JustinKe02/so101_lerobot/tree/groot-n1.7-inference) | GR00T N1.7 checkpoint 加载与 SO-101 rollout 接入 | 独立推理验证分支 |
@@ -74,7 +76,7 @@ lerobot-info
   在本轮上机中的任务效果接近。
 
 `realtime-vla-v2` 包含完整运行代码、推荐配置、中文报告和可审计机器日志。模型权重和原始轨迹
-体积较大，继续保存在本机 `outputs/`，不直接提交到 Git。
+体积较大，继续保存在本机 `outputs/` 或 `model_assets/`，不直接提交到 Git。
 
 ### 分支使用说明
 
@@ -90,6 +92,7 @@ lerobot-info
 - [PI0.5 TensorRT 故障排查](./PI05_TENSORRT_TROUBLESHOOTING.md)
 - [TensorRT 视觉加速分析](./WHY_TENSORRT_ONLY_ACCELERATES_VISION.md)
 - [SO-101 PI0.5 阶段总结](./PI05_T1_DAILY_SUMMARY_20260726.md)
+- [ACT 两轮真机推理日志报告](https://github.com/JustinKe02/so101_lerobot/blob/act-infer/ACT_INFERENCE_LOG_REPORT.md)
 - [VLASH 分支 README](https://github.com/JustinKe02/so101_lerobot/blob/pi05-vlash/README.md)
 - [Realtime-VLA V2 中文训练与上机报告](https://github.com/JustinKe02/so101_lerobot/blob/realtime-vla-v2/REALTIME_VLA_V2_DAILY_REPORT_20260809.md)
 - [Realtime-VLA V2 推荐配置](https://github.com/JustinKe02/so101_lerobot/blob/realtime-vla-v2/pi05_realtime_vla_v2_40ep_rtc6_triton_direct_rolling_p95.json)

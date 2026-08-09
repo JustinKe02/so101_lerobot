@@ -36,7 +36,7 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import make_dataset
 from lerobot.datasets.feature_utils import get_hf_features_from_features
 from lerobot.datasets.image_writer import image_array_to_pil_image
-from lerobot.datasets.io_utils import hf_transform_to_torch
+from lerobot.datasets.io_utils import hf_transform_to_torch, load_episodes
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.multi_dataset import MultiLeRobotDataset
 from lerobot.datasets.utils import (
@@ -503,6 +503,37 @@ def test_tmp_video_deletion(tmp_path, empty_lerobot_dataset_factory):
     assert not vid_img_dir.exists(), (
         "Temporary image directory should be removed when batch_encoding_size == 1"
     )
+
+
+def test_batched_video_encoding_handles_multiple_batches(tmp_path, empty_lerobot_dataset_factory):
+    video_keys = ("video.top", "video.wrist")
+    features = {
+        video_key: {"dtype": "video", "shape": DUMMY_HWC, "names": ["height", "width", "channels"]}
+        for video_key in video_keys
+    }
+    dataset = empty_lerobot_dataset_factory(
+        root=tmp_path / "batched-video",
+        features=features,
+        batch_encoding_size=2,
+        streaming_encoding=False,
+    )
+
+    for episode_index in range(4):
+        for frame_index in range(2):
+            frame = np.full(DUMMY_HWC, episode_index * 10 + frame_index, dtype=np.uint8)
+            dataset.add_frame(dict.fromkeys(video_keys, frame) | {"task": "Dummy task"})
+        dataset.save_episode()
+
+    dataset.finalize()
+
+    episodes = load_episodes(dataset.root)
+    assert len(episodes) == 4
+    for video_key in video_keys:
+        for field in ("chunk_index", "file_index", "from_timestamp", "to_timestamp"):
+            assert f"videos/{video_key}/{field}" in episodes.column_names
+        for episode_index in range(4):
+            assert not dataset.writer._get_image_file_dir(episode_index, video_key).exists()
+        assert list((dataset.root / "videos" / video_key).rglob("*.mp4"))
 
 
 def test_cleanup_interrupted_episode_removes_image_temp_dirs(tmp_path, empty_lerobot_dataset_factory):
