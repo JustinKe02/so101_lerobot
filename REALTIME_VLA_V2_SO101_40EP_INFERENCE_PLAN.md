@@ -145,25 +145,46 @@ placements as if the difference came only from the runtime.
 
 ## 4. Phase B: Training-Compatible Realtime-VLA V2
 
-Phase B starts only after adding the training-time RTC objective described in
-`REALTIME_VLA_V2_SO101_ADAPTATION.md`:
+Phase B is now implemented in the PI0.5 policy/runtime. The primary training
+run is full-unfreeze and starts with
+`src/lerobot/scripts/train_pi05_so101_realtime_vla_v2_full.sh`:
 
-1. Add `rtc_training_max_delay=6` to PI0.5 configuration and checkpoint metadata.
-2. Sample a clean prefix of 0-6 actions for each training sample.
-3. Set the clean-prefix flow timestep to zero and compute loss only on the postfix.
-4. Train an expert-only checkpoint first as the controlled comparison.
-5. If visual grounding remains the limiting factor, run a full-unfreeze version
-   with the same data order, seed, epochs, and checkpoint cadence.
-6. Reject trained-prefix inference for any checkpoint without a positive serialized
+1. The script sets `rtc_training_max_delay=6` in PI0.5 configuration and
+   checkpoint metadata.
+2. It samples a clean prefix of 0-6 actions for each training sample.
+3. It keeps the clean prefix in the flow input and computes normalized loss only
+   on the postfix. Postfix tokens receive sampled flow time while clean prefix
+   tokens receive time zero; AdaRMS carries that per-token time signal through
+   every action-expert layer.
+4. It sets both `train_expert_only=false` and `freeze_vision_encoder=false`, so
+   the VLM, vision encoder, projections, and action expert are all trainable.
+5. The expert-only script remains available only as a controlled ablation with
+   the same data order, seed, epochs, and checkpoint cadence.
+6. The runtime rejects trained-prefix inference for any checkpoint without a positive serialized
    `rtc_training_max_delay`.
 
 Start with `rtc_training_max_delay=6` because it covers the normal 4-5 consumed
 steps plus margin. The 19-step cold-start case must be handled by warmup and the
 runtime queue; it should not dictate the training prefix distribution.
 
-After a compatible checkpoint exists, add hard prefix inpainting at every
-denoising step and compare B1/B2 against A0/A1. TensorRT and time-axis QP should
-only be enabled after PyTorch parity and continuity gates pass.
+After a compatible checkpoint exists, select `--inference.mode=trained_prefix`;
+the runtime hard-inpaints the prefix at every denoising step and rejects delay
+overflow. The paper-style local stack is configured in
+`pi05_realtime_vla_v2_40ep_trained_prefix.json`: it enables the bounded
+time-axis planner, second-order action filter, delayed trajectory history, and
+JSONL trace. Keep the planner enabled only after offline endpoint/bounds checks
+pass; it falls back to the raw model chunk on numerical failure.
+
+Start the training run only after checking that the output directory does not
+already exist:
+
+```bash
+cd /data/cqy_workspace/tk/lerobot_src
+bash src/lerobot/scripts/train_pi05_so101_realtime_vla_v2_full.sh
+```
+
+The expert-only ablation is optional and must use its separate launcher and
+output directory; it is not a prerequisite for the full-unfreeze run.
 
 ## 5. Decision Rule
 

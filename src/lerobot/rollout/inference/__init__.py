@@ -22,16 +22,19 @@ from .base import InferenceEngine
 from .factory import (
     InferenceEngineConfig,
     RTCInferenceConfig,
+    RTCInferenceMode,
     SyncInferenceConfig,
     create_inference_engine,
 )
-from .rtc import RTCInferenceEngine
+from .rtc import RTCExecutorControlSnapshot, RTCInferenceEngine
 from .sync import SyncInferenceEngine
 
 __all__ = [
     "InferenceEngine",
     "InferenceEngineConfig",
     "RTCInferenceConfig",
+    "RTCExecutorControlSnapshot",
+    "RTCInferenceMode",
     "RTCInferenceEngine",
     "SyncInferenceConfig",
     "SyncInferenceEngine",

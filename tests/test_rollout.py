@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -562,6 +563,49 @@ def test_rollout_raises_when_inference_fails_during_teardown():
     assert exc_info.value.__cause__ is fatal_error
     strategy.run.assert_called_once_with(ctx)
     strategy.teardown.assert_called_once_with(ctx)
+
+
+def test_rollout_marks_trace_abnormal_when_hardware_teardown_fails(tmp_path):
+    from threading import Event
+
+    from lerobot.rollout.trajectory import RealtimeTraceWriter
+    from lerobot.scripts import lerobot_rollout as rollout_module
+
+    trace_path = tmp_path / "teardown-failure.jsonl"
+    trace = RealtimeTraceWriter(trace_path)
+    engine = MagicMock(failed=False, fatal_error=None)
+    ctx = SimpleNamespace(policy=SimpleNamespace(inference=engine, trace=trace))
+    strategy = MagicMock()
+    teardown_failure = RuntimeError("robot disconnect failed")
+    strategy.teardown.side_effect = teardown_failure
+    cfg = SimpleNamespace(
+        seed=None,
+        preflight_only=False,
+        display_data=False,
+        strategy=SimpleNamespace(type="base"),
+        robot=SimpleNamespace(type="mock"),
+        fps=30.0,
+        duration=1.0,
+    )
+
+    with (
+        patch.object(rollout_module, "init_logging"),
+        patch.object(
+            rollout_module,
+            "ProcessSignalHandler",
+            return_value=SimpleNamespace(shutdown_event=Event()),
+        ),
+        patch.object(rollout_module, "build_rollout_context", return_value=ctx),
+        patch.object(rollout_module, "create_strategy", return_value=strategy),
+        pytest.raises(RuntimeError, match="robot disconnect failed") as exc_info,
+    ):
+        rollout_module.rollout.__wrapped__(cfg)
+
+    assert exc_info.value is teardown_failure
+    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["event"] == "session_end"
+    assert records[-1]["status"] == "abnormal"
+    assert records[-1]["reason"] == "robot disconnect failed"
 
 
 def test_rollout_shuts_down_visualization_when_context_build_fails():

@@ -18,7 +18,7 @@ import logging
 import time
 from functools import cached_property
 
-from lerobot.cameras import make_cameras_from_configs
+from lerobot.cameras import Camera, make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
@@ -26,6 +26,7 @@ from lerobot.motors.feetech import (
 )
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
@@ -63,6 +64,9 @@ class SOFollower(Robot):
             calibration=self.calibration,
         )
         self.cameras = make_cameras_from_configs(config.cameras)
+        self._last_state_timestamp: float | None = None
+        self._last_camera_timestamps: dict[str, float] = {}
+        self._last_observation_timestamp: float | None = None
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -97,18 +101,47 @@ class SOFollower(Robot):
         and torque can be safely disabled to run calibration.
         """
 
-        self.bus.connect()
-        if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
-            )
-            self.calibrate()
+        attempted_cameras: list[Camera] = []
+        try:
+            self.bus.connect()
+            if not self.is_calibrated and calibrate:
+                logger.info(
+                    "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
+                )
+                self.calibrate()
 
-        for cam in self.cameras.values():
-            cam.connect()
+            for cam in self.cameras.values():
+                attempted_cameras.append(cam)
+                cam.connect()
 
-        self.configure()
+            self.configure()
+        except BaseException:
+            self._rollback_failed_connect(attempted_cameras)
+            raise
+
         logger.info(f"{self} connected.")
+
+    def _rollback_failed_connect(self, attempted_cameras: list[Camera]) -> None:
+        for cam in reversed(attempted_cameras):
+            try:
+                cam.disconnect()
+            except DeviceNotConnectedError:
+                pass
+            except BaseException:
+                logger.exception("Failed to disconnect %s during %s connection rollback.", cam, self)
+
+        if not self.bus.is_connected:
+            return
+
+        try:
+            self.bus.disable_torque(num_retry=_MOTOR_COMM_RETRIES)
+        except BaseException:
+            logger.exception("Failed to disable motor torque during %s connection rollback.", self)
+
+        try:
+            self.bus.disconnect(False)
+        except BaseException:
+            logger.exception("Failed to disconnect motor bus during %s connection rollback.", self)
 
     @property
     def is_calibrated(self) -> bool:
@@ -186,6 +219,7 @@ class SOFollower(Robot):
         # Read arm position
         start = time.perf_counter()
         obs_dict = self.bus.sync_read("Present_Position", num_retry=_MOTOR_COMM_RETRIES)
+        self._last_state_timestamp = time.perf_counter()
         obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
@@ -194,7 +228,13 @@ class SOFollower(Robot):
         for cam_key, cam in self.cameras.items():
             if getattr(cam, "use_rgb", True):
                 start = time.perf_counter()
-                obs_dict[cam_key] = cam.read_latest()
+                read_with_timestamp = getattr(cam, "read_latest_with_timestamp", None)
+                if callable(read_with_timestamp):
+                    obs_dict[cam_key], capture_timestamp = read_with_timestamp()
+                else:
+                    obs_dict[cam_key] = cam.read_latest()
+                    capture_timestamp = time.perf_counter()
+                self._last_camera_timestamps[cam_key] = float(capture_timestamp)
                 dt_ms = (time.perf_counter() - start) * 1e3
                 logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
@@ -204,7 +244,23 @@ class SOFollower(Robot):
                 dt_ms = (time.perf_counter() - start) * 1e3
                 logger.debug(f"{self} read {cam_key} depth: {dt_ms:.1f}ms")
 
+        self._last_observation_timestamp = time.perf_counter()
         return obs_dict
+
+    @property
+    def last_observation_timing(self) -> dict[str, object]:
+        """Timing metadata for the most recently returned observation.
+
+        The metadata is intentionally kept out of ``RobotObservation`` so it
+        cannot become an accidental dataset or policy feature.
+        """
+
+        return {
+            "clock": "monotonic",
+            "state_timestamp": self._last_state_timestamp,
+            "camera_timestamps": dict(self._last_camera_timestamps),
+            "observation_timestamp": self._last_observation_timestamp,
+        }
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
@@ -236,9 +292,21 @@ class SOFollower(Robot):
 
     @check_if_not_connected
     def disconnect(self):
-        self.bus.disconnect(self.config.disable_torque_on_disconnect)
+        failures: list[BaseException] = []
+        try:
+            self.bus.disconnect(self.config.disable_torque_on_disconnect)
+        except BaseException as exc:
+            failures.append(exc)
+            logger.exception("Failed to disconnect motor bus from %s.", self)
         for cam in self.cameras.values():
-            cam.disconnect()
+            try:
+                cam.disconnect()
+            except BaseException as exc:
+                failures.append(exc)
+                logger.exception("Failed to disconnect %s from %s.", cam, self)
+
+        if failures:
+            raise BaseExceptionGroup(f"One or more resources failed to disconnect from {self}", failures)
 
         logger.info(f"{self} disconnected.")
 

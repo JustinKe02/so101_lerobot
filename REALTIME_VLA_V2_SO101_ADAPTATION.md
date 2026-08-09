@@ -39,7 +39,7 @@ claim that can be transferred directly to SO-101.
 | `client/local_client.py` inference thread | Existing `RTCInferenceEngine` background thread |
 | `client/executor.py` delay-aligned queue | Existing actual-consumed RTC queue and merge diagnostics |
 | AIRBOT observer/actuator | Existing `SO101Follower` and LeRobot camera processors |
-| acados MPC | Deferred; use existing second-order output filter first |
+| acados MPC | Optional research backend; local path uses a bounded planner plus second-order filter |
 | HTTP + pickle transport | Omitted for the local-GPU path; add a structured remote transport only if needed |
 | Rerun/JSONL traces | Extend current rollout timing and action diagnostics |
 
@@ -66,42 +66,74 @@ second-order output filter + robot safety limits
 SO101Follower command dispatch
 ```
 
-## Implementation Phases
+## Current Implementation Status
+
+The first training/inference compatibility slice is now implemented in the
+LeRobot runtime:
+
+- `PI05Config.rtc_training_max_delay` defaults to zero for exact backward
+  compatibility.
+- Positive values sample a clean action prefix and apply postfix-only flow loss
+  with per-sample normalization.
+- RTC inference exposes `guided` and `trained_prefix` modes.
+- `trained_prefix` hard-inpaints the committed prefix after every denoising
+  step, rejects checkpoints without positive training capacity, and fails closed
+  when measured delay exceeds that capacity.
+- `src/lerobot/scripts/train_pi05_so101_realtime_vla_v2_full.sh` starts the
+  primary 40-episode full-unfreeze run with `rtc_training_max_delay=6`.
+- `src/lerobot/scripts/train_pi05_so101_realtime_vla_v2_expert_only.sh` is kept
+  only as an expert-only ablation for controlled comparison.
+
+The local path now includes a solver-independent time-axis planner,
+delay-aligned state/action history, and a unified JSONL trace. It does not
+pretend to include the reference repository's AIRBOT HTTP transport or an
+acados-generated contact MPC, which remain hardware-specific extensions.
+
+The runtime configuration intentionally keeps
+`realtime_executor.actuator_calibration.enabled=false` until an offline SO-101
+trace has produced a checksum-pinned calibration artifact. In that state the
+manually configured actuator constants are compatibility defaults, not SO-101
+measurements, and the configuration must not be described as paper-ready.
+Enabling calibration requires both an artifact path and its SHA-256; the
+runtime validates schema, source provenance, action dimension, and exact joint
+order before it can construct the executor.
 
 ### Phase 1: Training-Time RTC
 
-- Add `policy.rtc_training_max_delay`, defaulting to zero.
+- Add `policy.rtc_training_max_delay`, defaulting to zero. (Implemented.)
 - Sample a clean prefix length independently for every training sample.
-- Use per-action flow timesteps: zero for the clean prefix and the sampled
-  flow timestep for the postfix.
-- Exclude prefix positions from the flow loss.
+- Keep the committed prefix clean in the flow input and exclude it from the
+  normalized flow loss. Per-token flow-time conditioning remains a follow-up
+  because the current PI0.5 expert uses one AdaRMS timestep per sample.
 - Preserve bit-for-bit behavior when `rtc_training_max_delay=0`.
 
 ### Phase 2: Trained-Prefix Inference
 
-- Add an explicit RTC mode: `guided` or `trained`.
+- Add an explicit RTC mode: `guided` or `trained_prefix`. (Implemented.)
 - Hard-inpaint the committed action prefix at every denoising step in trained
-  mode; do not run the guided RTC backward pass in that mode.
-- Reject checkpoints without positive `rtc_training_max_delay`.
+  mode; do not run the guided RTC backward pass in that mode. (Implemented.)
+- Reject checkpoints without positive `rtc_training_max_delay`. (Implemented.)
 - Fail closed if measured delay exceeds the checkpoint's trained capacity.
+  (Implemented.)
 - Require queue threshold and execution horizon to cover the trained delay.
 - Keep the existing actual-consumed queue diagnostics and prefix-health gates.
 
 ### Phase 3: Time-Axis Planning
 
 - Port the reference time-axis objective as a chunk transform, not as a new
-  robot backend.
+  robot backend. (Implemented in `src/lerobot/rollout/time_axis.py`.)
 - Configure reference, minimum, and maximum control intervals explicitly.
-- Use per-joint velocity and acceleration limits in SO-101 units.
+- Use bounded policy-coordinate velocity limits; robot-coordinate velocity and
+  acceleration shaping remains the second-order output filter.
 - Preserve chunk endpoints and fall back to the original chunk on solver
   failure or non-finite output.
-- Apply the existing per-command safety clamp after planning.
+- Apply the existing per-command safety clamp after planning. (Implemented.)
 
 ### Phase 4: Replay and Diagnostics
 
 - Record raw chunk, trained-prefix chunk, time-parameterized chunk, filtered
-  command, applied command, measured state, inference start/end, and queue
-  indices on one monotonic timeline.
+  command, applied command, measured state, and inference timing in one JSONL
+  stream when `trace.enabled=true`.
 - Add dataset replay tests for boundary position/velocity/acceleration.
 - Compare guided RTC, trained-prefix RTC, and VLASH with the same checkpoint,
   observation sequence, and random seed.
@@ -119,6 +151,43 @@ The existing PI0.5 expert-only checkpoints were trained without action-prefix
 conditioning. They may use guided RTC but must not use trained-prefix mode.
 A compatible checkpoint must serialize a positive `rtc_training_max_delay` and
 must be trained from the start with the Phase 1 objective.
+
+## Offline Speed Labels
+
+Create an annotation template from a schema-v2 realtime trace; the template
+contains no generated beta, failure, or include labels:
+
+```bash
+lerobot-prepare-speed-throttle \
+  --trace outputs/traces/pi05_realtime_vla_v2_full_rtc15.jsonl \
+  --export-annotation-template outputs/traces/speed_annotations.template.jsonl
+```
+
+The exported rows already use the final annotation schema, but all human
+fields are `null`; an untouched template is rejected by conversion.
+
+After a human fills every annotation, create the strict per-segment dataset:
+
+```bash
+lerobot-prepare-speed-throttle \
+  --trace outputs/traces/pi05_realtime_vla_v2_full_rtc15.jsonl \
+  --annotations outputs/traces/speed_annotations.jsonl \
+  --output outputs/traces/speed_throttle.jsonl
+```
+
+Use `lerobot-prepare-speed-throttle --print-annotation-schema` for the exact
+annotation contract. The converter requires complete robot-space action chunks
+and writes trace and annotation SHA-256 provenance beside the output.
+
+Train only after reviewing that provenance and selecting explicit deployment
+bounds:
+
+```bash
+lerobot-train-speed-adapter \
+  --data outputs/traces/speed_throttle.jsonl \
+  --output-dir outputs/speed_adapter \
+  --beta-min 0.5 --beta-max 1.5
+```
 
 For 30 Hz SO-101 control, a maximum delay of four to six steps covers roughly
 133 to 200 ms. The initial experiment should use a conservative value within
@@ -140,5 +209,7 @@ that range and must keep it smaller than the 50-step action horizon.
 - AIRBOT SDK integration and 14-dimensional dual-arm assumptions.
 - Three-camera RealSense capture code.
 - Unauthenticated pickle-over-HTTP transport.
-- acados code generation and task-specific contact MPC.
+- acados code generation and task-specific contact MPC. The current planner
+  has a deterministic bounded fallback and must be tuned against SO-101 joint
+  limits before claiming parity with the reference paper.
 - Claims of reference-project speedup before SO-101 A/B measurements exist.

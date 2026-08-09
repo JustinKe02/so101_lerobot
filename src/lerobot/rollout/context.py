@@ -22,9 +22,13 @@ and :class:`DatasetContext` — assembled into :class:`RolloutContext`.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import math
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from threading import Event
 
+import numpy as np
 import torch
 
 from lerobot.configs import FeatureType
@@ -49,15 +53,30 @@ from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.feature_utils import combine_feature_dicts, hw_to_dataset_features
 
 from .action_filter import ActionDictOutputFilter, resolve_joint_limit
-from .configs import BaseStrategyConfig, DAggerStrategyConfig, RolloutConfig
+from .actuator_calibration import (
+    ActuatorCalibrationArtifact,
+    load_actuator_calibration_artifact,
+    normalize_action_joint_names,
+)
+from .configs import BaseStrategyConfig, DAggerStrategyConfig, PI05ActionBackend, RolloutConfig
 from .inference import (
     InferenceEngine,
     RTCInferenceConfig,
     SyncInferenceConfig,
     create_inference_engine,
 )
+from .joint_constraints import JointConstraintArtifact, load_joint_constraint_artifact
+from .pi05_parity import load_and_validate_pi05_parity_report
+from .realtime_executor import RealtimeExecutor, RealtimeExecutorConfig
 from .robot_wrapper import ThreadSafeRobot
+from .sensor_timing_calibration import (
+    SensorTimingCalibrationArtifact,
+    load_sensor_timing_calibration_artifact,
+)
+from .speed_adapter import SpeedAdapter, load_runtime_speed_adapter
 from .stall_guard import StallContactGuard
+from .time_axis import TimeAxisPlanner
+from .trajectory import DelayAlignedTrajectory, RealtimeTraceWriter
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +87,10 @@ class _HardwareBuildState:
 
     robot: object | None = None
     teleop: Teleoperator | None = None
+    trace: RealtimeTraceWriter | None = None
 
 
-def _rollback_hardware_build(state: _HardwareBuildState) -> None:
+def _rollback_hardware_build(state: _HardwareBuildState, reason: BaseException) -> None:
     """Best-effort rollback that never masks the context-build error."""
     for label, resource in (("teleoperator", state.teleop), ("robot", state.robot)):
         if resource is None:
@@ -81,6 +101,12 @@ def _rollback_hardware_build(state: _HardwareBuildState) -> None:
                 resource.disconnect()
         except BaseException:
             logger.exception("Failed to disconnect %s during rollout context rollback", label)
+    if state.trace is not None:
+        try:
+            state.trace.mark_abnormal(reason)
+            state.trace.close()
+        except BaseException:
+            logger.exception("Failed to finalize trace during rollout context rollback")
 
 
 def _resolve_action_key_order(
@@ -101,6 +127,344 @@ def _resolve_action_key_order(
         logger.warning("policy.action_feature_names keys don't match dataset; using dataset order")
         return dataset_action_names
     return policy_action_names
+
+
+def _configured_policy_action_dim(policy_config: object) -> int | None:
+    action_names = getattr(policy_config, "action_feature_names", None)
+    if action_names:
+        return len(action_names)
+    output_features = getattr(policy_config, "output_features", None)
+    if not isinstance(output_features, dict):
+        return None
+    action_feature = output_features.get("action")
+    shape = getattr(action_feature, "shape", None)
+    if isinstance(shape, (list, tuple)) and len(shape) == 1 and isinstance(shape[0], int):
+        return shape[0]
+    return None
+
+
+def _inject_pi05_parity_trace_provenance(
+    config_snapshot: dict,
+    validated_report: object | None,
+) -> None:
+    if validated_report is not None:
+        config_snapshot["resolved_pi05_triton_parity_report"] = validated_report.audit_snapshot()
+
+
+def _resolve_sensor_timing_calibration(cfg: RolloutConfig) -> SensorTimingCalibrationArtifact | None:
+    if not isinstance(cfg.inference, RTCInferenceConfig):
+        return None
+    timing_config = cfg.inference.sensor_timing_calibration
+    if not timing_config.enabled:
+        return None
+    if timing_config.path is None or timing_config.sha256 is None:
+        raise ValueError("enabled sensor timing calibration requires artifact path and SHA-256")
+    configured_cameras = tuple(getattr(cfg.robot, "cameras", {}))
+    artifact = load_sensor_timing_calibration_artifact(
+        timing_config.path,
+        expected_sha256=timing_config.sha256,
+        camera_keys=configured_cameras or None,
+    )
+    cfg.inference.camera_capture_delay_s = artifact.camera_delay_by_key
+    cfg.inference.image_capture_delay_s = artifact.conservative_image_capture_delay_s
+    cfg.inference.state_observation_delay_s = artifact.state_observation_delay_s
+    cfg.inference.max_camera_skew_s = artifact.max_camera_skew_s
+    cfg.inference.validate_policy_config(cfg.policy)
+    if cfg.inference.guidance_delay_mode.value == "fixed":
+        training_capacity = int(getattr(cfg.policy, "rtc_training_max_delay", 0))
+        effective_capacity = cfg.inference.max_prefill_steps or training_capacity
+        minimum_prefix_steps = (
+            cfg.inference.fixed_guidance_delay_steps
+            + math.floor(cfg.inference.image_capture_delay_s * cfg.fps + 1e-12)
+            + 1
+        )
+        if effective_capacity < minimum_prefix_steps:
+            raise ValueError(
+                "RTC prefix capacity cannot cover the calibrated image delay: "
+                f"minimum={minimum_prefix_steps}, capacity={effective_capacity}"
+            )
+    return artifact
+
+
+def _resolve_joint_constraint_artifact(cfg: RolloutConfig) -> JointConstraintArtifact | None:
+    planner_config = getattr(cfg, "time_axis_planner", None)
+    if planner_config is None:
+        return None
+    constraint_config = planner_config.joint_constraints
+    if not constraint_config.enabled:
+        return None
+    if constraint_config.path is None or constraint_config.sha256 is None:
+        raise ValueError("enabled joint constraints require artifact path and SHA-256")
+    policy_action_names = getattr(cfg.policy, "action_feature_names", None)
+    expected_joint_names = normalize_action_joint_names(policy_action_names) if policy_action_names else None
+    artifact = load_joint_constraint_artifact(
+        constraint_config.path,
+        expected_sha256=constraint_config.sha256,
+        joint_names=expected_joint_names,
+    )
+    planner_config.max_velocity = list(artifact.max_velocity)
+    planner_config.max_acceleration = list(artifact.max_acceleration)
+    if cfg.realtime_executor.enabled:
+        cfg.realtime_executor.max_velocity = dict(
+            zip(artifact.joint_names, artifact.max_velocity, strict=True)
+        )
+        cfg.realtime_executor.max_acceleration = dict(
+            zip(artifact.joint_names, artifact.max_acceleration, strict=True)
+        )
+    return artifact
+
+
+def _paper_ready_preflight_gaps(cfg: RolloutConfig) -> tuple[str, ...]:
+    """Return requirements that prevent an honest paper-ready V2 preflight."""
+
+    gaps: list[str] = []
+    if not isinstance(cfg.inference, RTCInferenceConfig):
+        gaps.append("RTC inference")
+    else:
+        if cfg.inference.mode.value != "trained_prefix":
+            gaps.append("trained-prefix RTC inference")
+        if cfg.inference.timing_mode.value != "actual_consumed":
+            gaps.append("actual-consumed RTC timing")
+        if not cfg.inference.dynamic_prefill_enabled:
+            gaps.append("dynamic action-prefix prefill")
+        if not cfg.inference.sensor_timing_calibration.enabled:
+            gaps.append("measured sensor timing calibration artifact")
+        if not cfg.inference.timing_diagnostics:
+            gaps.append("RTC timing diagnostics")
+
+    planner = cfg.time_axis_planner
+    if not planner.enabled:
+        gaps.append("time-axis planner")
+    if not planner.joint_constraints.enabled:
+        gaps.append("measured joint velocity/acceleration constraints artifact")
+
+    executor = cfg.realtime_executor
+    if not executor.enabled:
+        gaps.append("fixed-heartbeat realtime executor")
+    if not executor.actuator_calibration.enabled:
+        gaps.append("measured actuator calibration artifact")
+
+    speed_adapter = cfg.speed_adapter
+    if not speed_adapter.enabled or not speed_adapter.require_trained_checkpoint:
+        gaps.append("trained human-labeled speed adapter checkpoint")
+
+    if not cfg.trace.enabled:
+        gaps.append("schema-v2 deployment trace")
+    if cfg.pi05_action_backend != PI05ActionBackend.TRITON:
+        gaps.append("full PI0.5 Triton action backend")
+    if not cfg.pi05_triton_parity_report.enabled:
+        gaps.append("checksum-pinned PyTorch/Triton parity evidence")
+    if cfg.seed is None:
+        gaps.append("deterministic rollout seed")
+    if bool(getattr(cfg.policy, "freeze_vision_encoder", True)):
+        gaps.append("fully unfrozen vision encoder checkpoint")
+    if bool(getattr(cfg.policy, "train_expert_only", True)):
+        gaps.append("fully unfrozen non-expert policy checkpoint")
+    return tuple(gaps)
+
+
+def _raise_for_paper_ready_preflight_gaps(cfg: RolloutConfig) -> None:
+    gaps = _paper_ready_preflight_gaps(cfg)
+    if gaps:
+        formatted = "\n".join(f"  - {gap}" for gap in gaps)
+        raise ValueError(
+            "Paper-ready Realtime-VLA V2 preflight cannot run because required measured "
+            f"artifacts or runtime components are missing:\n{formatted}"
+        )
+
+
+def _build_realtime_executor(
+    cfg: RolloutConfig,
+    ordered_action_keys: list[str],
+    actuator_calibration: ActuatorCalibrationArtifact | None,
+) -> RealtimeExecutor | None:
+    if not cfg.realtime_executor.enabled:
+        return None
+    executor_velocity = cfg.realtime_executor.resolved_max_velocity()
+    executor_acceleration = cfg.realtime_executor.resolved_max_acceleration()
+    if actuator_calibration is not None:
+        actuator_tau_s = actuator_calibration.tau_s
+        command_delay_s = actuator_calibration.command_delay_s
+    else:
+        actuator_tau_s = cfg.realtime_executor.actuator_tau_s
+        command_delay_s = cfg.realtime_executor.command_delay_s
+    return RealtimeExecutor(
+        RealtimeExecutorConfig(
+            action_dim=len(ordered_action_keys),
+            heartbeat_dt_s=1.0 / cfg.fps,
+            max_velocity=[resolve_joint_limit(key, executor_velocity) for key in ordered_action_keys],
+            max_acceleration=[resolve_joint_limit(key, executor_acceleration) for key in ordered_action_keys],
+            actuator_tau_s=actuator_tau_s,
+            command_delay_s=command_delay_s,
+            enable_forward_tracking=cfg.realtime_executor.enable_forward_tracking,
+            forward_lead_s=cfg.realtime_executor.forward_lead_s,
+            forward_feedback_gain=cfg.realtime_executor.forward_feedback_gain,
+            savgol_window_length=cfg.realtime_executor.savgol_window_length,
+            savgol_polyorder=cfg.realtime_executor.savgol_polyorder,
+            max_waypoints=cfg.realtime_executor.max_waypoints,
+            max_command_history=cfg.realtime_executor.max_command_history,
+        )
+    )
+
+
+class _SoftwarePreflightRobot:
+    """Hardware-free robot surface used only to construct the RTC engine."""
+
+    name = "realtime-vla-v2-software-preflight"
+    robot_type = "software_preflight"
+    observation_features: dict = {}
+    is_connected = False
+
+    def __init__(self, action_keys: list[str]) -> None:
+        self.action_features = dict.fromkeys(action_keys, float)
+
+    def get_observation(self) -> dict:
+        raise AssertionError("paper-ready software preflight must not read robot hardware")
+
+    def send_action(self, action: dict) -> dict:
+        raise AssertionError("paper-ready software preflight must not command robot hardware")
+
+
+def _run_paper_ready_component_preflight(
+    cfg: RolloutConfig,
+    *,
+    policy: PreTrainedPolicy,
+    shutdown_event: Event,
+    sensor_timing_calibration: SensorTimingCalibrationArtifact | None,
+    joint_constraint_artifact: JointConstraintArtifact | None,
+    actuator_calibration: ActuatorCalibrationArtifact | None,
+    runtime_speed_adapter: SpeedAdapter | None,
+) -> tuple[str, ...]:
+    """Construct and lifecycle-smoke every non-hardware V2 runtime component."""
+
+    missing_loaded = [
+        name
+        for name, artifact in (
+            ("sensor timing calibration", sensor_timing_calibration),
+            ("joint constraints", joint_constraint_artifact),
+            ("actuator calibration", actuator_calibration),
+            ("speed adapter", runtime_speed_adapter),
+        )
+        if artifact is None
+    ]
+    if missing_loaded:
+        raise RuntimeError(
+            "Paper-ready preflight configured artifacts but did not load: " + ", ".join(missing_loaded)
+        )
+
+    action_keys = list(getattr(cfg.policy, "action_feature_names", ()) or ())
+    action_dim = _configured_policy_action_dim(cfg.policy)
+    if action_dim is None or action_dim < 1 or len(action_keys) != action_dim:
+        raise ValueError(
+            "Paper-ready preflight requires a complete ordered policy.action_feature_names layout"
+        )
+    joint_names = normalize_action_joint_names(action_keys)
+    actuator_calibration.validate_layout(action_dim=action_dim, joint_names=joint_names)
+    joint_constraint_artifact.validate_layout(joint_names)
+    if runtime_speed_adapter.config.action_dim != action_dim:
+        raise ValueError(
+            "Paper-ready speed adapter action dimension does not match the policy: "
+            f"adapter={runtime_speed_adapter.config.action_dim}, policy={action_dim}"
+        )
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=cfg.policy,
+        pretrained_path=cfg.policy.pretrained_path,
+        dataset_stats=None,
+        preprocessor_overrides={
+            "device_processor": {"device": cfg.device},
+            "rename_observations_processor": {"rename_map": cfg.rename_map},
+        },
+    )
+    _, robot_action_processor, _ = make_default_processors()
+
+    planner = TimeAxisPlanner(cfg.time_axis_planner, speed_adapter=runtime_speed_adapter)
+    waypoint_count = max(3, min(cfg.time_axis_planner.horizon + 1, 8))
+    synthetic_actions = np.zeros((waypoint_count, action_dim), dtype=np.float32)
+    state_dim = runtime_speed_adapter.config.state_dim
+    phase_dim = runtime_speed_adapter.config.phase_dim
+    plan = planner.plan(
+        synthetic_actions,
+        state_embeddings=(np.zeros((waypoint_count, state_dim), dtype=np.float32) if state_dim else None),
+        phase_embeddings=(np.zeros((waypoint_count, phase_dim), dtype=np.float32) if phase_dim else None),
+    )
+    if plan.used_fallback:
+        raise RuntimeError(f"Paper-ready time-axis planner smoke fell back: {plan.reason}")
+    if plan.actions.shape != synthetic_actions.shape or not np.isfinite(plan.actions).all():
+        raise RuntimeError("Paper-ready time-axis planner returned an invalid trajectory")
+
+    executor = _build_realtime_executor(cfg, action_keys, actuator_calibration)
+    if executor is None:
+        raise RuntimeError("Paper-ready realtime executor was not constructed")
+    initial = np.zeros(action_dim, dtype=np.float64)
+    start = 1.0
+    dt = executor.config.heartbeat_dt_s
+    executor.reset(initial, timestamp=start, observation_timestamp=start)
+    waypoint_timestamps = start + np.arange(3, dtype=np.float64) * dt
+    command = executor.control_step(
+        start,
+        waypoint_timestamps,
+        np.zeros((3, action_dim), dtype=np.float64),
+        initial,
+        observation_timestamp=start,
+    )
+    preview = executor.preview(2)
+    if command.shape != (action_dim,) or len(preview) != 2 or not np.isfinite(command).all():
+        raise RuntimeError("Paper-ready realtime executor smoke returned invalid commands")
+
+    trajectory = DelayAlignedTrajectory(cfg.trace.max_history)
+    robot_wrapper = ThreadSafeRobot(_SoftwarePreflightRobot(action_keys))
+    with tempfile.TemporaryDirectory(prefix="lerobot-v2-preflight-") as temporary_directory:
+        trace = RealtimeTraceWriter(
+            Path(temporary_directory) / "trace.jsonl",
+            config_snapshot={"preflight_require_paper_ready": True},
+        )
+        engine = None
+        try:
+            engine = create_inference_engine(
+                cfg.inference,
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                robot_wrapper=robot_wrapper,
+                hw_features={},
+                dataset_features={},
+                ordered_action_keys=action_keys,
+                task=cfg.dataset.single_task if cfg.dataset else cfg.task,
+                fps=cfg.fps,
+                device=cfg.device,
+                use_torch_compile=cfg.use_torch_compile,
+                compile_warmup_inferences=cfg.compile_warmup_inferences,
+                shutdown_event=shutdown_event,
+                time_axis_planner=planner,
+                trace=trace,
+                trajectory=trajectory,
+                realtime_executor=executor,
+                robot_action_processor=robot_action_processor,
+                action_filter=None,
+                stall_guard=None,
+            )
+            if not engine.owns_action_dispatch:
+                raise RuntimeError("Paper-ready RTC engine did not assign dispatch ownership to executor")
+            engine.start()
+            engine.stop()
+            if engine.failed:
+                raise RuntimeError("Paper-ready RTC engine lifecycle smoke entered a fatal state")
+            trace.close()
+            if not trace.closed:
+                raise RuntimeError("Paper-ready trace lifecycle smoke did not write a terminal record")
+        finally:
+            if engine is not None:
+                engine.stop()
+            trace.close()
+
+    return (
+        "policy_processors",
+        "time_axis_planner",
+        "realtime_executor",
+        "rtc_engine_lifecycle",
+        "trace_lifecycle",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +515,10 @@ class PolicyContext:
     action_filter: ActionDictOutputFilter | None = None
     # Optional stall/contact guard watching the same dispatch stream.
     stall_guard: StallContactGuard | None = None
+    time_axis_planner: TimeAxisPlanner | None = None
+    trace: RealtimeTraceWriter | None = None
+    trajectory: DelayAlignedTrajectory | None = None
+    realtime_executor: RealtimeExecutor | None = None
 
 
 @dataclass
@@ -186,6 +554,20 @@ class RolloutContext:
     data: DatasetContext
 
 
+@dataclass(frozen=True)
+class RolloutPreflightResult:
+    """Successful software-only validation completed before hardware construction."""
+
+    policy_type: str
+    device: str
+    action_backend: str
+    trained_prefix_max: int | None
+    warmed_prefix_lengths: tuple[int, ...]
+    validated_artifacts: tuple[str, ...]
+    paper_ready_requested: bool = False
+    component_checks: tuple[str, ...] = ()
+
+
 # ---------------------------------------------------------------------------
 # Build
 # ---------------------------------------------------------------------------
@@ -197,7 +579,7 @@ def build_rollout_context(
     teleop_action_processor: RobotProcessorPipeline | None = None,
     robot_action_processor: RobotProcessorPipeline | None = None,
     robot_observation_processor: RobotProcessorPipeline | None = None,
-) -> RolloutContext:
+) -> RolloutContext | RolloutPreflightResult:
     """Build a rollout context and release connected hardware on failure."""
     hardware_state = _HardwareBuildState()
     try:
@@ -209,8 +591,8 @@ def build_rollout_context(
             robot_observation_processor=robot_observation_processor,
             hardware_state=hardware_state,
         )
-    except BaseException:
-        _rollback_hardware_build(hardware_state)
+    except BaseException as exc:
+        _rollback_hardware_build(hardware_state, exc)
         raise
 
 
@@ -222,18 +604,81 @@ def _build_rollout_context(
     robot_observation_processor: RobotProcessorPipeline | None = None,
     *,
     hardware_state: _HardwareBuildState,
-) -> RolloutContext:
+) -> RolloutContext | RolloutPreflightResult:
     """Wire up policy, processors, hardware, dataset, and inference engine.
 
     The order is policy-first / hardware-last so a bad ``--policy.path``
     fails fast without touching the robot.
     """
     is_rtc = isinstance(cfg.inference, RTCInferenceConfig)
+    paper_ready_preflight = bool(getattr(cfg, "preflight_require_paper_ready", False))
+    if paper_ready_preflight:
+        _raise_for_paper_ready_preflight_gaps(cfg)
+    validated_pi05_parity_report = None
+    if getattr(cfg, "pi05_action_backend", PI05ActionBackend.PYTORCH) == PI05ActionBackend.TRITON:
+        validated_pi05_parity_report = load_and_validate_pi05_parity_report(
+            cfg.pi05_triton_parity_report,
+            checkpoint_path=cfg.policy.pretrained_path,
+            triton_weights_path=cfg.pi05_triton_export_weights,
+            triton_weights_sha256=cfg.pi05_triton_weights_sha256,
+            triton_model_config_path=cfg.resolved_pi05_triton_model_config(),
+            training_max_delay=cfg.policy.rtc_training_max_delay,
+        )
+        logger.info(
+            "Validated checksum-pinned PI0.5 Triton parity before CUDA and hardware: "
+            "report_sha256=%s, prefixes=%s, max_abs_errors=%s",
+            validated_pi05_parity_report.sha256,
+            validated_pi05_parity_report.prefixes,
+            validated_pi05_parity_report.max_abs_errors,
+        )
+    sensor_timing_calibration = _resolve_sensor_timing_calibration(cfg)
+    joint_constraint_artifact = _resolve_joint_constraint_artifact(cfg)
+
+    actuator_calibration: ActuatorCalibrationArtifact | None = None
+    realtime_executor_config = getattr(cfg, "realtime_executor", None)
+    if (
+        realtime_executor_config is not None
+        and realtime_executor_config.enabled
+        and realtime_executor_config.actuator_calibration.enabled
+    ):
+        calibration_config = realtime_executor_config.actuator_calibration
+        if calibration_config.path is None or calibration_config.sha256 is None:
+            raise ValueError("enabled actuator calibration requires both artifact path and SHA-256")
+        policy_action_names = getattr(cfg.policy, "action_feature_names", None)
+        expected_joint_names = (
+            normalize_action_joint_names(policy_action_names) if policy_action_names else None
+        )
+        actuator_calibration = load_actuator_calibration_artifact(
+            calibration_config.path,
+            expected_sha256=calibration_config.sha256,
+            action_dim=len(expected_joint_names) if expected_joint_names is not None else None,
+            joint_names=expected_joint_names,
+        )
+    runtime_speed_adapter: SpeedAdapter | None = None
+    speed_adapter_metadata: dict | None = None
+    speed_adapter_config = getattr(cfg, "speed_adapter", None)
+    loaded_speed_adapter = (
+        load_runtime_speed_adapter(
+            speed_adapter_config,
+            expected_action_dim=_configured_policy_action_dim(cfg.policy),
+        )
+        if speed_adapter_config is not None
+        else None
+    )
+    if loaded_speed_adapter is not None:
+        runtime_speed_adapter, speed_adapter_metadata = loaded_speed_adapter
+        logger.info(
+            "Validated speed adapter checkpoint before hardware connection: path=%s, "
+            "action_dim=%d, beta=[%.6f, %.6f]",
+            speed_adapter_config.checkpoint,
+            runtime_speed_adapter.config.action_dim,
+            runtime_speed_adapter.config.beta_min,
+            runtime_speed_adapter.config.beta_max,
+        )
 
     # --- 1. Policy (heavy I/O, but no hardware yet) -------------------
-    logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
+    task_str = cfg.dataset.single_task if cfg.dataset else getattr(cfg, "task", "")
     policy_config = cfg.policy
-    policy_class = get_policy_class(policy_config.type)
 
     if hasattr(policy_config, "compile_model"):
         policy_config.compile_model = cfg.use_torch_compile
@@ -244,19 +689,67 @@ def _build_rollout_context(
             "Please use `cpu` or `cuda` backend."
         )
 
-    if policy_config.use_peft:
-        from peft import PeftConfig, PeftModel
-
-        peft_path = policy_config.pretrained_path
-        peft_config = PeftConfig.from_pretrained(peft_path)
-        policy = policy_class.from_pretrained(
-            pretrained_name_or_path=peft_config.base_model_name_or_path, config=policy_config
+    if getattr(cfg, "pi05_action_backend", PI05ActionBackend.PYTORCH) == PI05ActionBackend.TRITON:
+        from lerobot.policies.pi05.realtime_vla_v2_triton import (
+            PI05RealtimeVLATritonBackend,
+            PI05RealtimeVLATritonConfig,
+            PI05RealtimeVLATritonPolicyAdapter,
         )
-        policy = PeftModel.from_pretrained(policy, peft_path, config=peft_config)
+
+        camera_keys = cfg.resolved_pi05_triton_camera_keys()
+        logger.info(
+            "Loading and warming full PI0.5 realtime-vla-v2 Triton backend before hardware: %s",
+            cfg.pi05_triton_export_weights,
+        )
+        triton_config = PI05RealtimeVLATritonConfig(
+            prompt=task_str,
+            tokenizer_path=cfg.pi05_triton_tokenizer_path,
+            camera_keys=camera_keys,
+            weights_path=cfg.pi05_triton_export_weights,
+            model_config_path=cfg.resolved_pi05_triton_model_config(),
+            weights_sha256=cfg.pi05_triton_weights_sha256,
+            device=cfg.device,
+            image_value_range="zero_one",
+            tokenizer_max_length=cfg.pi05_triton_tokenizer_max_length,
+            prompt_capacity=cfg.pi05_triton_prompt_capacity,
+            noise_seed=cfg.seed,
+            min_free_cuda_gib=cfg.pi05_triton_min_free_cuda_gib,
+        )
+        triton_backend = PI05RealtimeVLATritonBackend.from_export(triton_config)
+        policy = PI05RealtimeVLATritonPolicyAdapter(
+            triton_backend,
+            policy_config,
+            camera_keys=camera_keys,
+            task=task_str,
+        )
+        logger.info(
+            "Full PI0.5 Triton backend ready: cameras=%s, chunk=50, action_dim=6, prefix_capacity=%d",
+            camera_keys,
+            triton_backend.trained_prefix_max,
+        )
     else:
-        policy = policy_class.from_pretrained(policy_config.pretrained_path, config=policy_config)
+        logger.info("Loading policy from '%s'...", cfg.policy.pretrained_path)
+        policy_class = get_policy_class(policy_config.type)
+        if policy_config.use_peft:
+            from peft import PeftConfig, PeftModel
+
+            peft_path = policy_config.pretrained_path
+            peft_config = PeftConfig.from_pretrained(peft_path)
+            policy = policy_class.from_pretrained(
+                pretrained_name_or_path=peft_config.base_model_name_or_path, config=policy_config
+            )
+            policy = PeftModel.from_pretrained(policy, peft_path, config=peft_config)
+        else:
+            policy = policy_class.from_pretrained(policy_config.pretrained_path, config=policy_config)
 
     if is_rtc:
+        if cfg.inference.mode.value == "trained_prefix":
+            training_capacity = getattr(policy_config, "rtc_training_max_delay", 0)
+            if training_capacity <= 0:
+                raise ValueError(
+                    "trained_prefix RTC mode requires policy.rtc_training_max_delay > 0; "
+                    "the loaded checkpoint was not trained with action-prefix conditioning"
+                )
         policy.config.rtc_config = cfg.inference.rtc
         if hasattr(policy, "init_rtc_processor"):
             policy.init_rtc_processor()
@@ -294,6 +787,61 @@ def _build_rollout_context(
                 logger.info("torch.compile applied to predict_action_chunk")
         except Exception as e:
             logger.warning("Failed to apply torch.compile: %s", e)
+
+    if getattr(cfg, "preflight_only", False):
+        trained_prefix_max: int | None = None
+        warmed_prefix_lengths: tuple[int, ...] = ()
+        if cfg.pi05_action_backend == PI05ActionBackend.TRITON:
+            trained_prefix_max = int(triton_backend.trained_prefix_max)
+            warmed_prefix_lengths = tuple(triton_backend.warmed_prefill_lengths)
+            expected_warmup = tuple(range(trained_prefix_max + 1))
+            if warmed_prefix_lengths != expected_warmup:
+                raise RuntimeError(
+                    "Triton preflight did not warm every trained prefix length: "
+                    f"warmed={warmed_prefix_lengths}, expected={expected_warmup}"
+                )
+        validated_artifacts = tuple(
+            name
+            for name, present in (
+                ("sensor_timing", sensor_timing_calibration is not None),
+                ("joint_constraints", joint_constraint_artifact is not None),
+                ("actuator_calibration", actuator_calibration is not None),
+                ("speed_adapter", runtime_speed_adapter is not None),
+                ("triton_parity", validated_pi05_parity_report is not None),
+            )
+            if present
+        )
+        component_checks = ()
+        if paper_ready_preflight:
+            component_checks = _run_paper_ready_component_preflight(
+                cfg,
+                policy=policy,
+                shutdown_event=shutdown_event,
+                sensor_timing_calibration=sensor_timing_calibration,
+                joint_constraint_artifact=joint_constraint_artifact,
+                actuator_calibration=actuator_calibration,
+                runtime_speed_adapter=runtime_speed_adapter,
+            )
+        logger.info(
+            "Software-only rollout preflight passed: policy=%s backend=%s artifacts=%s "
+            "prefixes=%s paper_ready=%s component_checks=%s",
+            policy_config.type,
+            cfg.pi05_action_backend.value,
+            validated_artifacts,
+            warmed_prefix_lengths,
+            paper_ready_preflight,
+            component_checks,
+        )
+        return RolloutPreflightResult(
+            policy_type=policy_config.type,
+            device=str(cfg.device),
+            action_backend=cfg.pi05_action_backend.value,
+            trained_prefix_max=trained_prefix_max,
+            warmed_prefix_lengths=warmed_prefix_lengths,
+            validated_artifacts=validated_artifacts,
+            paper_ready_requested=paper_ready_preflight,
+            component_checks=component_checks,
+        )
 
     # --- 2. Robot-side processors (user-supplied or defaults) --------
     if (
@@ -380,6 +928,13 @@ def _build_rollout_context(
         list(policy_action_names) if policy_action_names else None,
         raw_action_keys,
     )
+    if runtime_speed_adapter is not None and runtime_speed_adapter.config.action_dim != len(
+        ordered_action_keys
+    ):
+        raise ValueError(
+            "speed adapter action dimension does not match the resolved robot action layout: "
+            f"checkpoint={runtime_speed_adapter.config.action_dim}, robot={len(ordered_action_keys)}"
+        )
 
     # Validate visual features if no rename_map is active
     rename_map = cfg.rename_map
@@ -489,28 +1044,87 @@ def _build_rollout_context(
         "Creating inference engine (type=%s)...",
         cfg.inference.type if hasattr(cfg.inference, "type") else "sync",
     )
-    task_str = cfg.dataset.single_task if cfg.dataset else cfg.task
-    inference_strategy = create_inference_engine(
-        cfg.inference,
-        policy=policy,
-        preprocessor=preprocessor,
-        postprocessor=postprocessor,
-        robot_wrapper=robot_wrapper,
-        hw_features=hw_features,
-        dataset_features=dataset_features,
-        ordered_action_keys=ordered_action_keys,
-        task=task_str,
-        fps=cfg.fps,
-        device=cfg.device,
-        use_torch_compile=cfg.use_torch_compile,
-        compile_warmup_inferences=cfg.compile_warmup_inferences,
-        shutdown_event=shutdown_event,
+    if actuator_calibration is not None:
+        actuator_calibration.validate_layout(
+            action_dim=len(ordered_action_keys),
+            joint_names=normalize_action_joint_names(ordered_action_keys),
+        )
+    if joint_constraint_artifact is not None:
+        joint_constraint_artifact.validate_layout(normalize_action_joint_names(ordered_action_keys))
+    time_axis_planner = (
+        TimeAxisPlanner(cfg.time_axis_planner, speed_adapter=runtime_speed_adapter)
+        if cfg.time_axis_planner.enabled
+        else None
     )
+    trace_config_snapshot = asdict(cfg)
+    _inject_pi05_parity_trace_provenance(
+        trace_config_snapshot,
+        validated_pi05_parity_report,
+    )
+    if actuator_calibration is not None:
+        trace_config_snapshot["realtime_executor"]["resolved_actuator_calibration"] = (
+            actuator_calibration.audit_snapshot()
+        )
+    if sensor_timing_calibration is not None:
+        trace_config_snapshot["inference"]["resolved_sensor_timing_calibration"] = (
+            sensor_timing_calibration.audit_snapshot()
+        )
+    if joint_constraint_artifact is not None:
+        trace_config_snapshot["time_axis_planner"]["resolved_joint_constraint_provenance"] = (
+            joint_constraint_artifact.audit_snapshot()
+        )
+    if speed_adapter_metadata is not None:
+        trace_config_snapshot["speed_adapter"]["resolved_checkpoint"] = {
+            key: speed_adapter_metadata[key]
+            for key in (
+                "format",
+                "format_version",
+                "architecture",
+                "feature_contract",
+                "output_contract",
+                "provenance",
+                "weights",
+            )
+        }
+    trace = (
+        RealtimeTraceWriter(cfg.trace.path, config_snapshot=trace_config_snapshot)
+        if cfg.trace.enabled
+        else None
+    )
+    hardware_state.trace = trace
+    trajectory = DelayAlignedTrajectory(cfg.trace.max_history)
+    realtime_executor = _build_realtime_executor(cfg, ordered_action_keys, actuator_calibration)
+    if realtime_executor is not None:
+        logger.info(
+            "Realtime smooth executor enabled: heartbeat_dt=%.6f, savgol=%d/%d, tau_s=%s, command_delay_s=%s",
+            1.0 / cfg.fps,
+            cfg.realtime_executor.savgol_window_length,
+            cfg.realtime_executor.savgol_polyorder,
+            realtime_executor.config.actuator_tau_s.tolist(),
+            realtime_executor.config.command_delay_s.tolist(),
+        )
+        if actuator_calibration is not None:
+            logger.info(
+                "Validated actuator calibration: artifact_sha256=%s, source_sha256=%s, "
+                "joint_names=%s, fit_boundary_status=%s",
+                actuator_calibration.artifact_sha256,
+                actuator_calibration.source_sha256,
+                list(actuator_calibration.joint_names),
+                actuator_calibration.audit_snapshot()["fit_boundary_status"],
+            )
+        else:
+            logger.info(
+                "Realtime executor is using manually configured actuator parameters; "
+                "they are not marked as SO-101 measurements"
+            )
 
-    # --- 8. Action output filter (policy dispatch stream only) --------
+    # Dispatch guards are built before the inference engine because an enabled
+    # realtime executor owns the fixed-heartbeat hardware dispatch path.
     action_filter = None
     if cfg.action_filter.enabled:
-        filter_dt = 1.0 / (cfg.fps * cfg.interpolation_multiplier)
+        filter_dt = (
+            1.0 / cfg.fps if realtime_executor is not None else 1.0 / (cfg.fps * cfg.interpolation_multiplier)
+        )
         max_velocity = cfg.action_filter.resolved_max_velocity()
         max_acceleration = cfg.action_filter.resolved_max_acceleration()
         action_filter = ActionDictOutputFilter(
@@ -536,6 +1150,30 @@ def _build_rollout_context(
             cfg.stall_guard_tolerance,
         )
 
+    inference_strategy = create_inference_engine(
+        cfg.inference,
+        policy=policy,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        robot_wrapper=robot_wrapper,
+        hw_features=hw_features,
+        dataset_features=dataset_features,
+        ordered_action_keys=ordered_action_keys,
+        task=task_str,
+        fps=cfg.fps,
+        device=cfg.device,
+        use_torch_compile=cfg.use_torch_compile,
+        compile_warmup_inferences=cfg.compile_warmup_inferences,
+        shutdown_event=shutdown_event,
+        time_axis_planner=time_axis_planner,
+        trace=trace,
+        trajectory=trajectory,
+        realtime_executor=realtime_executor,
+        robot_action_processor=robot_action_processor,
+        action_filter=action_filter,
+        stall_guard=stall_guard,
+    )
+
     # --- 9. Assemble ---------------------------------------------------
     logger.info("Rollout context assembled successfully")
     return RolloutContext(
@@ -550,6 +1188,10 @@ def _build_rollout_context(
             inference=inference_strategy,
             action_filter=action_filter,
             stall_guard=stall_guard,
+            time_axis_planner=time_axis_planner,
+            trace=trace,
+            trajectory=trajectory,
+            realtime_executor=realtime_executor,
         ),
         processors=ProcessorContext(
             teleop_action_processor=teleop_action_processor,

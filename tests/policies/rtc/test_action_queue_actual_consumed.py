@@ -207,3 +207,71 @@ def test_snapshot_with_future_consumption_count_is_rejected() -> None:
 
     assert queue.snapshot().generation == 0
     assert queue.empty() is True
+
+
+def test_anchor_merge_preserves_committed_actions_when_inference_finishes_early() -> None:
+    queue = ActionQueue(RTCConfig(enabled=True))
+    original = _actions()
+    processed = original + 100.0
+    queue.merge(original, processed, real_delay=0)
+    inference_start = queue.snapshot()
+    _consume(queue, 2)
+    postfix = _actions(steps=4, offset=1000.0)
+
+    result = queue.merge_postfix_at_anchor(
+        postfix,
+        postfix + 100.0,
+        inference_start,
+        anchor_steps_after_start=4,
+    )
+
+    assert result.merged is True
+    assert result.actual_consumed_steps == 2
+    assert result.preserved_steps == 3
+    assert result.postfix_skip == 0
+    assert torch.equal(queue.get(), processed[2])
+    assert torch.equal(queue.get(), processed[3])
+    assert torch.equal(queue.get(), processed[4])
+    assert torch.equal(queue.get(), postfix[0] + 100.0)
+
+
+def test_anchor_merge_skips_only_postfix_that_became_stale() -> None:
+    queue = ActionQueue(RTCConfig(enabled=True))
+    base = _actions()
+    queue.merge(base, base, real_delay=0)
+    inference_start = queue.snapshot()
+    _consume(queue, 6)
+    postfix = _actions(steps=4, offset=1000.0)
+
+    result = queue.merge_postfix_at_anchor(
+        postfix,
+        postfix,
+        inference_start,
+        anchor_steps_after_start=4,
+    )
+
+    assert result.merged is True
+    assert result.actual_consumed_steps == 6
+    assert result.preserved_steps == 0
+    assert result.postfix_skip == 1
+    assert torch.equal(queue.get(), postfix[1])
+
+
+def test_anchor_merge_fails_closed_when_committed_queue_is_too_short() -> None:
+    queue = ActionQueue(RTCConfig(enabled=True))
+    base = _actions(steps=3)
+    queue.merge(base, base, real_delay=0)
+    inference_start = queue.snapshot()
+    postfix = _actions(steps=3, offset=1000.0)
+
+    result = queue.merge_postfix_at_anchor(
+        postfix,
+        postfix,
+        inference_start,
+        anchor_steps_after_start=4,
+    )
+
+    assert result.merged is False
+    assert result.insufficient_committed_actions is True
+    assert result.preserved_steps == 5
+    assert torch.equal(queue.get(), base[0])

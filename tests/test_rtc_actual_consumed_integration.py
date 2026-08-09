@@ -18,10 +18,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -29,6 +31,8 @@ from lerobot.policies.rtc.action_queue import ActionQueue
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.rollout.inference import rtc as rtc_module
 from lerobot.rollout.inference.rtc import RTCInferenceEngine
+from lerobot.rollout.time_axis import TimeAxisPlan
+from lerobot.rollout.trajectory import RealtimeTraceWriteError, RealtimeTraceWriter
 
 
 class _IdentityProcessor:
@@ -96,6 +100,23 @@ class _FakeTime:
         self._engine._shutdown_event.set()
 
 
+class _FailingTrace(RealtimeTraceWriter):
+    def __init__(self) -> None:
+        self.write_count = 0
+        self.abnormal_reason: object | None = None
+
+    def write(self, event: str, **fields) -> None:
+        del event, fields
+        self.write_count += 1
+        raise RealtimeTraceWriteError("synthetic trace write failure")
+
+    def mark_abnormal(self, reason: object | None = None) -> None:
+        self.abnormal_reason = reason
+
+    def close(self, **_kwargs) -> None:
+        pass
+
+
 def _chunk(*, start: float, steps: int = 50) -> torch.Tensor:
     return torch.arange(start, start + steps, dtype=torch.float32).reshape(1, steps, 1)
 
@@ -105,6 +126,8 @@ def _make_engine(
     *,
     timing_diagnostics: bool = True,
     enforce_guided_execution_window: bool = False,
+    time_axis_planner=None,
+    trace: RealtimeTraceWriter | None = None,
 ) -> tuple[RTCInferenceEngine, _IdentityProcessor, _IdentityProcessor]:
     preprocessor = _IdentityProcessor()
     postprocessor = _IdentityProcessor()
@@ -125,6 +148,8 @@ def _make_engine(
         fixed_guidance_delay_steps=5,
         timing_diagnostics=timing_diagnostics,
         enforce_guided_execution_window=enforce_guided_execution_window,
+        time_axis_planner=time_axis_planner,
+        trace=trace,
     )
     engine._action_queue = ActionQueue(rtc_config)
     engine.notify_observation({})
@@ -177,6 +202,57 @@ def test_empty_queue_ignores_thirteen_wall_steps_and_uses_fixed_guidance(
     assert "actual_consumed_steps=0 merge_skip=0" in caplog.text
     assert "source_chunk_generation=1 next_model_action_index=0" in caplog.text
     assert "RTC action dequeue: source_chunk_generation=1 model_action_index=0" in caplog.text
+
+
+def test_inference_trace_records_speed_adapter_reference_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    class _DiagnosticPlanner:
+        @staticmethod
+        def plan(actions, *, committed_prefix_steps: int) -> TimeAxisPlan:
+            del committed_prefix_steps
+            array = np.asarray(actions.detach().cpu())
+            segments = len(array) - 1
+            return TimeAxisPlan(
+                actions=array,
+                segment_durations=np.full(segments, 0.025),
+                used_fallback=False,
+                reference_segment_durations=np.full(segments, 0.025),
+                speed_factors=np.full(segments, 2.0),
+            )
+
+    trace_path = tmp_path / "rtc_trace.jsonl"
+    trace = RealtimeTraceWriter(trace_path)
+    policy = _FakePolicy(_chunk(start=0.0))
+    engine, _, _ = _make_engine(policy, time_axis_planner=_DiagnosticPlanner(), trace=trace)
+
+    _run_one_inference(monkeypatch, engine, latency_s=0.1)
+    trace.close()
+
+    rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    event = next(row for row in rows if row["event"] == "inference_chunk")
+    assert event["planner_speed_factors"] == [2.0] * 49
+    assert event["planner_reference_segment_durations"] == [0.025] * 49
+    assert event["planner_feature_coordinate_space"] is None
+
+
+def test_inference_trace_write_failure_immediately_enters_fatal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace = _FailingTrace()
+    policy = _FakePolicy(_chunk(start=0.0))
+    engine, _, _ = _make_engine(policy, trace=trace)
+    monkeypatch.setattr(rtc_module, "time", _FakeTime(engine, 0.1))
+
+    engine._rtc_loop()
+
+    assert engine.failed is True
+    assert engine.fatal_error is not None
+    assert str(engine.fatal_error) == "RTC deployment trace write failed"
+    assert trace.write_count == 1
+    assert trace.abnormal_reason is engine.fatal_error
+    assert len(policy.calls) == 1
 
 
 def test_existing_queue_skips_exactly_four_actions_consumed_during_inference(

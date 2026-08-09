@@ -27,6 +27,7 @@ import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 from threading import Event
+from typing import Any
 
 import draccus
 
@@ -34,7 +35,11 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.processor import PolicyProcessorPipeline
 
+from ..realtime_executor import RealtimeExecutor
 from ..robot_wrapper import ThreadSafeRobot
+from ..sensor_timing_calibration import SensorTimingCalibrationArtifactConfig
+from ..time_axis import TimeAxisPlanner
+from ..trajectory import DelayAlignedTrajectory, RealtimeTraceWriter
 from .base import InferenceEngine
 from .rtc import RTCInferenceEngine
 from .sync import SyncInferenceEngine
@@ -56,6 +61,20 @@ class RTCGuidanceDelayMode(StrEnum):
     LEGACY_MAX = "legacy_max"
     FIXED = "fixed"
     ROLLING_P95 = "rolling_p95"
+
+
+class RTCInferenceMode(StrEnum):
+    """How the policy handles the previously committed action prefix."""
+
+    GUIDED = "guided"
+    TRAINED_PREFIX = "trained_prefix"
+
+
+class RTCPrefillOverflowMode(StrEnum):
+    """Behavior when the timestamp-aligned prefix exceeds checkpoint capacity."""
+
+    ERROR = "error"
+    TRUNCATE_OLDEST = "truncate_oldest"
 
 
 @dataclass
@@ -104,6 +123,7 @@ class RTCInferenceConfig(InferenceEngineConfig):
     # Eagerly constructed so draccus exposes nested fields directly on the CLI
     # (e.g. ``--inference.rtc.execution_horizon=...``).
     rtc: RTCConfig = field(default_factory=RTCConfig)
+    mode: RTCInferenceMode = RTCInferenceMode.GUIDED
     queue_threshold: int = 30
     timing_mode: RTCTimingMode = RTCTimingMode.LEGACY
     guidance_delay_mode: RTCGuidanceDelayMode = RTCGuidanceDelayMode.LEGACY_MAX
@@ -119,10 +139,26 @@ class RTCInferenceConfig(InferenceEngineConfig):
     prefix_health_severe_residual_threshold: float = 5.0
     prefix_health_consecutive_severe: int = 3
     prefix_health_safety_stop_replans: int = 0
+    dynamic_prefill_enabled: bool = False
+    sensor_timing_calibration: SensorTimingCalibrationArtifactConfig = field(
+        default_factory=SensorTimingCalibrationArtifactConfig
+    )
+    image_capture_delay_s: float = 0.0
+    camera_capture_delay_s: dict[str, float] = field(default_factory=dict)
+    state_observation_delay_s: float = 0.0
+    max_prefill_steps: int = 0
+    max_camera_skew_s: float = 0.05
+    prefill_overflow: RTCPrefillOverflowMode = RTCPrefillOverflowMode.ERROR
 
     def __post_init__(self) -> None:
+        self.mode = RTCInferenceMode(self.mode)
         self.timing_mode = RTCTimingMode(self.timing_mode)
         self.guidance_delay_mode = RTCGuidanceDelayMode(self.guidance_delay_mode)
+        self.prefill_overflow = RTCPrefillOverflowMode(self.prefill_overflow)
+        if not isinstance(self.sensor_timing_calibration, SensorTimingCalibrationArtifactConfig):
+            raise ValueError(
+                "inference.sensor_timing_calibration must be a SensorTimingCalibrationArtifactConfig"
+            )
         if self.queue_threshold < 0:
             raise ValueError("RTC queue_threshold must be non-negative")
         if self.fixed_guidance_delay_steps < 0:
@@ -146,6 +182,49 @@ class RTCInferenceConfig(InferenceEngineConfig):
             raise ValueError("RTC prefix_health_consecutive_severe must be positive")
         if self.prefix_health_safety_stop_replans < 0:
             raise ValueError("RTC prefix_health_safety_stop_replans must be non-negative")
+        for name in ("image_capture_delay_s", "state_observation_delay_s", "max_camera_skew_s"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"RTC {name} must be finite and non-negative")
+        for camera_key, value in self.camera_capture_delay_s.items():
+            if not isinstance(camera_key, str) or not camera_key.strip():
+                raise ValueError("RTC camera_capture_delay_s keys must be non-empty strings")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"RTC camera_capture_delay_s[{camera_key!r}] must be numeric")
+            if not math.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(
+                    f"RTC camera_capture_delay_s[{camera_key!r}] must be finite and non-negative"
+                )
+        if self.sensor_timing_calibration.enabled and not self.dynamic_prefill_enabled:
+            raise ValueError("sensor timing calibration requires RTC dynamic_prefill_enabled=true")
+        if (
+            isinstance(self.max_prefill_steps, bool)
+            or not isinstance(self.max_prefill_steps, int)
+            or self.max_prefill_steps < 0
+        ):
+            raise ValueError("RTC max_prefill_steps must be a non-negative integer")
+        if self.mode == RTCInferenceMode.TRAINED_PREFIX and not self.rtc.enabled:
+            raise ValueError("RTC trained_prefix mode requires rtc.enabled=true")
+        if self.dynamic_prefill_enabled:
+            if self.mode != RTCInferenceMode.TRAINED_PREFIX:
+                raise ValueError("RTC dynamic prefill requires mode='trained_prefix'")
+            if self.timing_mode != RTCTimingMode.ACTUAL_CONSUMED:
+                raise ValueError("RTC dynamic prefill requires timing_mode='actual_consumed'")
+            if self.prefill_overflow != RTCPrefillOverflowMode.ERROR:
+                raise ValueError(
+                    "RTC dynamic prefill requires prefill_overflow='error'; truncation drops the image anchor"
+                )
+            if self.max_prefill_steps > self.rtc.execution_horizon:
+                raise ValueError("RTC max_prefill_steps must not exceed rtc.execution_horizon")
+            if (
+                self.max_prefill_steps > 0
+                and self.guidance_delay_mode == RTCGuidanceDelayMode.FIXED
+                and self.max_prefill_steps <= self.fixed_guidance_delay_steps
+            ):
+                raise ValueError(
+                    "RTC max_prefill_steps must exceed fixed_guidance_delay_steps "
+                    "to include the completion anchor"
+                )
 
         if self.timing_mode == RTCTimingMode.LEGACY:
             if self.enforce_guided_execution_window:
@@ -182,6 +261,54 @@ class RTCInferenceConfig(InferenceEngineConfig):
                 f"queue_threshold={self.queue_threshold}, chunk_size={chunk_size}"
             )
 
+    def validate_policy_config(self, policy_config: object) -> None:
+        """Validate policy-dependent RTC invariants before hardware is connected."""
+        self.validate_policy_chunk_size(getattr(policy_config, "chunk_size", None))
+        if self.mode != RTCInferenceMode.TRAINED_PREFIX:
+            return
+        if getattr(policy_config, "type", None) != "pi05":
+            raise ValueError("trained_prefix RTC mode currently requires a pi05 policy")
+
+        training_capacity = getattr(policy_config, "rtc_training_max_delay", 0)
+        if (
+            isinstance(training_capacity, bool)
+            or not isinstance(training_capacity, int)
+            or training_capacity <= 0
+        ):
+            raise ValueError(
+                "trained_prefix RTC mode requires a checkpoint with positive integer "
+                "policy.rtc_training_max_delay"
+            )
+        if self.dynamic_prefill_enabled:
+            effective_capacity = self.max_prefill_steps or training_capacity
+            if effective_capacity > training_capacity:
+                raise ValueError(
+                    "RTC max_prefill_steps exceeds checkpoint training capacity: "
+                    f"requested={effective_capacity}, capacity={training_capacity}"
+                )
+            if effective_capacity > self.rtc.execution_horizon:
+                raise ValueError(
+                    "RTC effective max_prefill_steps exceeds rtc.execution_horizon: "
+                    f"effective={effective_capacity}, execution_horizon={self.rtc.execution_horizon}"
+                )
+            if (
+                self.guidance_delay_mode == RTCGuidanceDelayMode.FIXED
+                and effective_capacity <= self.fixed_guidance_delay_steps
+            ):
+                raise ValueError(
+                    "RTC effective max_prefill_steps must exceed fixed_guidance_delay_steps "
+                    "to include the completion anchor"
+                )
+        elif (
+            self.timing_mode == RTCTimingMode.ACTUAL_CONSUMED
+            and self.guidance_delay_mode == RTCGuidanceDelayMode.FIXED
+            and self.fixed_guidance_delay_steps > training_capacity
+        ):
+            raise ValueError(
+                "RTC fixed_guidance_delay_steps exceeds checkpoint training capacity: "
+                f"requested={self.fixed_guidance_delay_steps}, capacity={training_capacity}"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Factory
@@ -204,6 +331,13 @@ def create_inference_engine(
     use_torch_compile: bool = False,
     compile_warmup_inferences: int = 2,
     shutdown_event: Event | None = None,
+    time_axis_planner: TimeAxisPlanner | None = None,
+    trace: RealtimeTraceWriter | None = None,
+    trajectory: DelayAlignedTrajectory | None = None,
+    realtime_executor: RealtimeExecutor | None = None,
+    robot_action_processor: Any | None = None,
+    action_filter: Any | None = None,
+    stall_guard: Any | None = None,
 ) -> InferenceEngine:
     """Instantiate the appropriate inference engine from a config object."""
     logger.info("Creating inference engine: %s", config.type)
@@ -222,7 +356,7 @@ def create_inference_engine(
             clamp_replan_threshold=config.clamp_replan_threshold,
         )
     if isinstance(config, RTCInferenceConfig):
-        config.validate_policy_chunk_size(getattr(policy.config, "chunk_size", None))
+        config.validate_policy_config(policy.config)
         return RTCInferenceEngine(
             policy=policy,
             preprocessor=preprocessor,
@@ -236,6 +370,7 @@ def create_inference_engine(
             use_torch_compile=use_torch_compile,
             compile_warmup_inferences=compile_warmup_inferences,
             rtc_queue_threshold=config.queue_threshold,
+            rtc_inference_mode=config.mode.value,
             rtc_timing_mode=config.timing_mode.value,
             guidance_delay_mode=config.guidance_delay_mode.value,
             fixed_guidance_delay_steps=config.fixed_guidance_delay_steps,
@@ -250,6 +385,21 @@ def create_inference_engine(
             prefix_health_severe_residual_threshold=config.prefix_health_severe_residual_threshold,
             prefix_health_consecutive_severe=config.prefix_health_consecutive_severe,
             prefix_health_safety_stop_replans=config.prefix_health_safety_stop_replans,
+            dynamic_prefill_enabled=config.dynamic_prefill_enabled,
+            image_capture_delay_s=config.image_capture_delay_s,
+            camera_capture_delay_s=config.camera_capture_delay_s,
+            state_observation_delay_s=config.state_observation_delay_s,
+            max_prefill_steps=config.max_prefill_steps,
+            max_camera_skew_s=config.max_camera_skew_s,
+            prefill_overflow=config.prefill_overflow.value,
             shutdown_event=shutdown_event,
+            time_axis_planner=time_axis_planner,
+            trace=trace,
+            trajectory=trajectory,
+            realtime_executor=realtime_executor,
+            ordered_action_keys=ordered_action_keys,
+            robot_action_processor=robot_action_processor,
+            action_filter=action_filter,
+            stall_guard=stall_guard,
         )
     raise ValueError(f"Unknown inference engine type: {type(config).__name__}")

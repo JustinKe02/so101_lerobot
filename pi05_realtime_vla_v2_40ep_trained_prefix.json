@@ -1,0 +1,77 @@
+{
+  "robot": {
+    "type": "so101_follower",
+    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7C123192-if00",
+    "id": "tk_follower",
+    "calibration_dir": "/data/cqy_workspace/tk/hf_cache/huggingface/lerobot/calibration/robots/so_follower",
+    "max_relative_target": 6.0,
+    "cameras": {
+      "top": {"type": "opencv", "index_or_path": "/dev/video4", "width": 640, "height": 480, "fps": 30, "backend": 200},
+      "wrist": {"type": "opencv", "index_or_path": "/dev/video6", "width": 640, "height": 480, "fps": 30, "backend": 200}
+    }
+  },
+  "policy": {
+    "path": "/data/cqy_workspace/tk/lerobot_src/outputs/train/pi05_so101_realtime_vla_v2_full_10epochs_rtc6_seed1000/checkpoints/005613/pretrained_model",
+    "gradient_checkpointing": false,
+    "num_inference_steps": 10
+  },
+  "strategy": {"type": "base"},
+  "inference": {
+    "type": "rtc",
+    "mode": "trained_prefix",
+    "queue_threshold": 20,
+    "timing_mode": "actual_consumed",
+    "guidance_delay_mode": "fixed",
+    "fixed_guidance_delay_steps": 5,
+    "timing_diagnostics": true,
+    "prefix_health_enabled": true,
+    "prefix_health_severe_residual_threshold": 5.0,
+    "prefix_health_consecutive_severe": 3,
+    "prefix_health_safety_stop_replans": 2,
+    "rtc": {
+      "enabled": true,
+      "execution_horizon": 20,
+      "max_guidance_weight": 10.0,
+      "prefix_attention_schedule": "EXP"
+    }
+  },
+  "time_axis_planner": {
+    "enabled": true,
+    "dt_ref": 0.0333333333,
+    "dt_min": 0.020,
+    "dt_max": 0.100,
+    "lambda_acc": 1.0,
+    "lambda_time": 0.1,
+    "lambda_velocity": 10.0,
+    "max_velocity": 2.0,
+    "max_acceleration": 8.0,
+    "horizon": 20,
+    "optimization_dims": [0, 1, 2, 3, 4, 5]
+  },
+  "speed_adapter": {
+    "enabled": false,
+    "device": "cpu",
+    "verify_checksum": true,
+    "require_trained_checkpoint": true,
+    "feature_coordinate_space": "robot_action_units"
+  },
+  "trace": {
+    "enabled": true,
+    "path": "outputs/traces/pi05_realtime_vla_v2_trained_prefix.jsonl",
+    "max_history": 512
+  },
+  "fps": 30,
+  "duration": 30,
+  "interpolation_multiplier": 1,
+  "device": "cuda",
+  "task": "Put the block in the bin",
+  "seed": 1000,
+  "display_data": false,
+  "play_sounds": false,
+  "return_to_initial_position": true,
+  "action_filter": {"enabled": true},
+  "stall_guard_ticks": 5,
+  "stall_guard_tolerance": 0.001,
+  "pi05_prefix_backend": "pytorch",
+  "pi05_action_backend": "pytorch"
+}

@@ -121,6 +121,25 @@ def test_context_disconnects_teleop_then_robot_when_later_build_step_fails(monke
     assert disconnect_order == ["teleop", "robot"]
 
 
+def test_context_build_rollback_marks_and_closes_trace(tmp_path):
+    import json
+
+    from lerobot.rollout import context as context_module
+    from lerobot.rollout.trajectory import RealtimeTraceWriter
+
+    trace_path = tmp_path / "context-failure.jsonl"
+    trace = RealtimeTraceWriter(trace_path)
+    failure = RuntimeError("context assembly failed")
+    state = context_module._HardwareBuildState(trace=trace)
+
+    context_module._rollback_hardware_build(state, failure)
+
+    records = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["event"] == "session_end"
+    assert records[-1]["status"] == "abnormal"
+    assert records[-1]["reason"] == "context assembly failed"
+
+
 def _make_strategy(kind: str):
     if kind == "sentry":
         from lerobot.rollout.strategies.sentry import SentryStrategy, SentryStrategyConfig

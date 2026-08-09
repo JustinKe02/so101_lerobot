@@ -15,7 +15,13 @@
 """Real-Time Chunking (RTC) utilities for action-chunking policies."""
 
 from .action_interpolator import ActionInterpolator
-from .action_queue import ActionQueue, ActionQueueMergeResult, ActionQueuePopResult, ActionQueueSnapshot
+from .action_queue import (
+    ActionQueue,
+    ActionQueueAnchorMergeResult,
+    ActionQueueMergeResult,
+    ActionQueuePopResult,
+    ActionQueueSnapshot,
+)
 from .configuration_rtc import RTCConfig
 from .latency_tracker import GuidanceDelayEstimator, LatencyTracker
 from .modeling_rtc import RTCProcessor
@@ -24,6 +30,7 @@ from .relative import reanchor_relative_rtc_prefix
 __all__ = [
     "ActionInterpolator",
     "ActionQueue",
+    "ActionQueueAnchorMergeResult",
     "ActionQueueMergeResult",
     "ActionQueuePopResult",
     "ActionQueueSnapshot",

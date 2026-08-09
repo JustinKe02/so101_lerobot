@@ -56,6 +56,7 @@ class ActionQueuePopResult:
     model_action_index: int | None
     total_consumed: int
     queue_size_after: int
+    processed_leftover: Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,24 @@ class ActionQueueMergeResult:
     merge_skip: int
     skip_was_clamped: bool
     queue_size_after: int
+    consumption_limit_exceeded: bool = False
+
+
+@dataclass(frozen=True)
+class ActionQueueAnchorMergeResult:
+    """Outcome of merging a postfix generated for a future queue anchor."""
+
+    merged: bool
+    stale: bool
+    expected_generation: int
+    observed_generation: int
+    generation_after: int
+    actual_consumed_steps: int
+    anchor_steps_after_start: int
+    preserved_steps: int
+    postfix_skip: int
+    queue_size_after: int
+    insufficient_committed_actions: bool = False
     consumption_limit_exceeded: bool = False
 
 
@@ -143,6 +162,7 @@ class ActionQueue:
                     model_action_index=None,
                     total_consumed=self._total_consumed,
                     queue_size_after=0,
+                    processed_leftover=None,
                 )
 
             model_action_index = (
@@ -159,6 +179,7 @@ class ActionQueue:
                 model_action_index=model_action_index,
                 total_consumed=self._total_consumed,
                 queue_size_after=self._queue_size_unlocked(),
+                processed_leftover=self.queue[self.last_index :].clone(),
             )
 
     def clear(self) -> None:
@@ -400,6 +421,197 @@ class ActionQueue:
                 skip_was_clamped=skip_was_clamped,
                 queue_size_after=self._queue_size_unlocked(),
             )
+
+    def merge_postfix_at_anchor(
+        self,
+        original_postfix: Tensor,
+        processed_postfix: Tensor,
+        inference_start: ActionQueueSnapshot,
+        anchor_steps_after_start: int,
+        max_actual_consumed_steps: int | None = None,
+    ) -> ActionQueueAnchorMergeResult:
+        """Merge model postfix whose first action follows a predicted future anchor.
+
+        ``anchor_steps_after_start`` is the zero-based index, in the queue
+        snapshot taken at request time, of the final committed action supplied
+        to the model. If inference returns before that action is consumed, the
+        still-committed queue prefix is retained. If it returns later, only the
+        now-stale part of the generated postfix is skipped.
+        """
+
+        if isinstance(anchor_steps_after_start, bool) or anchor_steps_after_start < -1:
+            raise ValueError("anchor_steps_after_start must be an integer greater than or equal to -1")
+        if max_actual_consumed_steps is not None and max_actual_consumed_steps <= 0:
+            raise ValueError("max_actual_consumed_steps must be positive")
+        if not self.cfg.enabled:
+            raise ValueError("Anchor-based postfix merge requires RTC to be enabled")
+
+        with self.lock:
+            observed_generation = self._generation
+            actual_consumed = max(0, self._total_consumed - inference_start.total_consumed)
+
+            def result(
+                *,
+                merged: bool,
+                stale: bool = False,
+                preserved_steps: int = 0,
+                postfix_skip: int = 0,
+                insufficient: bool = False,
+                limit_exceeded: bool = False,
+            ) -> ActionQueueAnchorMergeResult:
+                return ActionQueueAnchorMergeResult(
+                    merged=merged,
+                    stale=stale,
+                    expected_generation=inference_start.generation,
+                    observed_generation=observed_generation,
+                    generation_after=self._generation,
+                    actual_consumed_steps=actual_consumed,
+                    anchor_steps_after_start=anchor_steps_after_start,
+                    preserved_steps=preserved_steps,
+                    postfix_skip=postfix_skip,
+                    queue_size_after=self._queue_size_unlocked(),
+                    insufficient_committed_actions=insufficient,
+                    consumption_limit_exceeded=limit_exceeded,
+                )
+
+            if observed_generation != inference_start.generation:
+                logger.warning(
+                    "Discarding stale anchored inference result. expected_generation=%d, observed_generation=%d",
+                    inference_start.generation,
+                    observed_generation,
+                )
+                return result(merged=False, stale=True)
+            if self._total_consumed < inference_start.total_consumed:
+                raise ValueError(
+                    "inference_start.total_consumed cannot exceed the queue's current total: "
+                    f"start={inference_start.total_consumed}, current={self._total_consumed}"
+                )
+            if max_actual_consumed_steps is not None and actual_consumed >= max_actual_consumed_steps:
+                return result(merged=False, limit_exceeded=True)
+
+            remaining_through_anchor = anchor_steps_after_start + 1 - actual_consumed
+            preserved_steps = max(0, remaining_through_anchor)
+            postfix_skip = max(0, -remaining_through_anchor)
+
+            current_original = None if self.original_queue is None else self.original_queue[self.last_index :]
+            current_processed = None if self.queue is None else self.queue[self.last_index :]
+            available = min(
+                0 if current_original is None else len(current_original),
+                0 if current_processed is None else len(current_processed),
+            )
+            if preserved_steps > available:
+                logger.error(
+                    "Committed anchor is no longer available in the action queue: required=%d available=%d",
+                    preserved_steps,
+                    available,
+                )
+                return result(
+                    merged=False,
+                    preserved_steps=preserved_steps,
+                    postfix_skip=postfix_skip,
+                    insufficient=True,
+                )
+            if postfix_skip >= len(original_postfix) or postfix_skip >= len(processed_postfix):
+                logger.error(
+                    "Anchored inference result is fully stale: postfix_skip=%d original=%d processed=%d",
+                    postfix_skip,
+                    len(original_postfix),
+                    len(processed_postfix),
+                )
+                return result(
+                    merged=False,
+                    preserved_steps=preserved_steps,
+                    postfix_skip=postfix_skip,
+                    insufficient=True,
+                )
+
+            original_parts = []
+            processed_parts = []
+            if preserved_steps:
+                original_parts.append(current_original[:preserved_steps].clone())
+                processed_parts.append(current_processed[:preserved_steps].clone())
+            original_parts.append(original_postfix[postfix_skip:].clone())
+            processed_parts.append(processed_postfix[postfix_skip:].clone())
+            self.original_queue = torch.cat(original_parts, dim=0)
+            self.queue = torch.cat(processed_parts, dim=0)
+            self.last_index = 0
+            self._generation += 1
+            if preserved_steps:
+                self._source_chunk_generation = None
+                self._source_model_start_index = None
+            else:
+                self._source_chunk_generation = self._generation
+                self._source_model_start_index = postfix_skip
+            return result(
+                merged=True,
+                preserved_steps=preserved_steps,
+                postfix_skip=postfix_skip,
+            )
+
+    def merge_postfix_after_external_anchor(
+        self,
+        original_postfix: Tensor,
+        processed_postfix: Tensor,
+        inference_start: ActionQueueSnapshot,
+        *,
+        external_consumed_steps: int,
+        committed_steps: int,
+        max_actual_consumed_steps: int | None = None,
+    ) -> ActionQueueAnchorMergeResult:
+        """Merge a postfix whose committed prefix is owned by an external executor.
+
+        The executor keeps dispatching its immutable preview trajectory while
+        inference runs, so those committed commands must not be copied back into
+        this raw action queue and smoothed a second time. The queue receives only
+        the generated postfix; a caller-side heartbeat barrier prevents it from
+        being consumed before the committed executor prefix completes.
+        """
+
+        if isinstance(external_consumed_steps, bool) or external_consumed_steps < 0:
+            raise ValueError("external_consumed_steps must be a non-negative integer")
+        if isinstance(committed_steps, bool) or committed_steps < 0:
+            raise ValueError("committed_steps must be a non-negative integer")
+        if max_actual_consumed_steps is not None and max_actual_consumed_steps <= 0:
+            raise ValueError("max_actual_consumed_steps must be positive")
+        if not self.cfg.enabled:
+            raise ValueError("External-anchor postfix merge requires RTC to be enabled")
+
+        with self.lock:
+            observed_generation = self._generation
+            postfix_skip = max(0, external_consumed_steps - committed_steps)
+
+            def result(
+                *,
+                merged: bool,
+                stale: bool = False,
+                limit_exceeded: bool = False,
+                insufficient: bool = False,
+            ) -> ActionQueueAnchorMergeResult:
+                return ActionQueueAnchorMergeResult(
+                    merged=merged,
+                    stale=stale,
+                    expected_generation=inference_start.generation,
+                    observed_generation=observed_generation,
+                    generation_after=self._generation,
+                    actual_consumed_steps=external_consumed_steps,
+                    anchor_steps_after_start=committed_steps - 1,
+                    preserved_steps=0,
+                    postfix_skip=postfix_skip,
+                    queue_size_after=self._queue_size_unlocked(),
+                    insufficient_committed_actions=insufficient,
+                    consumption_limit_exceeded=limit_exceeded,
+                )
+
+            if observed_generation != inference_start.generation:
+                return result(merged=False, stale=True)
+            if max_actual_consumed_steps is not None and external_consumed_steps >= max_actual_consumed_steps:
+                return result(merged=False, limit_exceeded=True)
+            if postfix_skip >= len(original_postfix) or postfix_skip >= len(processed_postfix):
+                return result(merged=False, insufficient=True)
+
+            self._replace_actions_queue(original_postfix, processed_postfix, postfix_skip)
+            self._generation += 1
+            return result(merged=True)
 
     def _queue_size_unlocked(self) -> int:
         """Return remaining queue size while the caller holds ``self.lock``."""

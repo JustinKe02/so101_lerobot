@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import time
 from threading import Lock
 from typing import Any
 
@@ -36,16 +37,38 @@ class ThreadSafeRobot:
     def __init__(self, robot: Robot) -> None:
         self._robot = robot
         self._lock = Lock()
+        self._last_observation_timing: dict[str, Any] | None = None
 
     # -- Lock-protected I/O --------------------------------------------------
 
     def get_observation(self) -> dict[str, Any]:
         with self._lock:
-            return self._robot.get_observation()
+            started_at = time.perf_counter()
+            observation = self._robot.get_observation()
+            finished_at = time.perf_counter()
+            timing = getattr(self._robot, "last_observation_timing", None)
+            if callable(timing):
+                timing = timing()
+            if not isinstance(timing, dict):
+                timing = {
+                    "clock": "monotonic",
+                    "state_timestamp": (started_at + finished_at) / 2.0,
+                    "camera_timestamps": {},
+                    "observation_timestamp": finished_at,
+                }
+            self._last_observation_timing = dict(timing)
+            return observation
 
     def send_action(self, action: dict[str, Any] | Any) -> Any:
         with self._lock:
             return self._robot.send_action(action)
+
+    @property
+    def last_observation_timing(self) -> dict[str, Any] | None:
+        """Return a copy of the most recent monotonic observation metadata."""
+
+        with self._lock:
+            return None if self._last_observation_timing is None else dict(self._last_observation_timing)
 
     # -- Read-only proxies (no lock needed) -----------------------------------
 

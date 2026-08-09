@@ -121,8 +121,13 @@ class PiGemmaRMSNorm(nn.Module):
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dim {self.cond_dim}, got {cond.shape[-1]}")
         modulation = self.dense(cond)
-        if len(x.shape) == 3:
+        if x.ndim == 3 and cond.ndim == 2:
             modulation = modulation.unsqueeze(1)
+        if modulation.ndim != x.ndim:
+            raise ValueError(
+                f"AdaRMS condition rank must match hidden states after broadcast: "
+                f"x={tuple(x.shape)}, cond={tuple(cond.shape)}"
+            )
         scale, shift, gate = modulation.chunk(3, dim=-1)
         normed = normed * (1 + scale.float()) + shift.float()
         return normed.to(dtype), gate.to(dtype)

@@ -48,6 +48,22 @@ def _make_bus_mock() -> MagicMock:
     return bus
 
 
+def _make_camera_mock(name: str, cleanup_order: list[str]) -> MagicMock:
+    camera = MagicMock(name=name)
+    camera.is_connected = False
+
+    def _connect():
+        camera.is_connected = True
+
+    def _disconnect():
+        cleanup_order.append(name)
+        camera.is_connected = False
+
+    camera.connect.side_effect = _connect
+    camera.disconnect.side_effect = _disconnect
+    return camera
+
+
 @pytest.fixture
 def follower():
     bus_mock = _make_bus_mock()
@@ -86,6 +102,81 @@ def test_connect_disconnect(follower):
 
     follower.disconnect()
     assert not follower.is_connected
+
+
+def test_connect_rolls_back_bus_and_partial_cameras_when_second_camera_fails(follower):
+    cleanup_order: list[str] = []
+    first = _make_camera_mock("first", cleanup_order)
+    second = _make_camera_mock("second", cleanup_order)
+    unattempted = _make_camera_mock("unattempted", cleanup_order)
+
+    def _fail_second_connect():
+        second.is_connected = True
+        raise RuntimeError("second camera failed")
+
+    second.connect.side_effect = _fail_second_connect
+    follower.cameras = {"first": first, "second": second, "unattempted": unattempted}
+
+    with pytest.raises(RuntimeError, match="second camera failed"):
+        follower.connect()
+
+    assert cleanup_order == ["second", "first"]
+    first.disconnect.assert_called_once_with()
+    second.disconnect.assert_called_once_with()
+    unattempted.connect.assert_not_called()
+    unattempted.disconnect.assert_not_called()
+    follower.bus.disable_torque.assert_called_once_with(num_retry=3)
+    follower.bus.disconnect.assert_called_once_with(False)
+    assert not follower.bus.is_connected
+
+
+def test_connect_rolls_back_all_resources_when_configure_fails(follower):
+    cleanup_order: list[str] = []
+    first = _make_camera_mock("first", cleanup_order)
+    second = _make_camera_mock("second", cleanup_order)
+    follower.cameras = {"first": first, "second": second}
+    follower.configure = MagicMock(side_effect=RuntimeError("configure failed"))
+
+    with pytest.raises(RuntimeError, match="configure failed"):
+        follower.connect()
+
+    assert cleanup_order == ["second", "first"]
+    first.disconnect.assert_called_once_with()
+    second.disconnect.assert_called_once_with()
+    follower.bus.disable_torque.assert_called_once_with(num_retry=3)
+    follower.bus.disconnect.assert_called_once_with(False)
+    assert not follower.bus.is_connected
+
+
+def test_disconnect_attempts_every_resource_and_aggregates_failures(follower):
+    cleanup_order: list[str] = []
+    first = _make_camera_mock("first", cleanup_order)
+    second = _make_camera_mock("second", cleanup_order)
+    follower.cameras = {"first": first, "second": second}
+    follower.connect()
+
+    def _fail_bus_disconnect(_disable=True):
+        follower.bus.is_connected = False
+        raise RuntimeError("bus disconnect failed")
+
+    def _fail_first_disconnect():
+        cleanup_order.append("first")
+        first.is_connected = False
+        raise RuntimeError("first camera disconnect failed")
+
+    follower.bus.disconnect.side_effect = _fail_bus_disconnect
+    first.disconnect.side_effect = _fail_first_disconnect
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        follower.disconnect()
+
+    assert [str(error) for error in exc_info.value.exceptions] == [
+        "bus disconnect failed",
+        "first camera disconnect failed",
+    ]
+    assert cleanup_order == ["first", "second"]
+    second.disconnect.assert_called_once_with()
+    assert not second.is_connected
 
 
 def test_get_observation(follower):

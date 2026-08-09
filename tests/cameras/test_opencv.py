@@ -20,6 +20,7 @@
 # ```
 
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 
 import cv2
@@ -41,10 +42,14 @@ class MockLoopingVideoCapture:
     Consequence: No recurrent I/O operations, but we keep the test artifacts simple.
     """
 
+    instances: ClassVar[list["MockLoopingVideoCapture"]] = []
+
     def __init__(self, *args, **kwargs):
         args_clean = [str(a) if isinstance(a, Path) else a for a in args]
         self._real_vc = RealVideoCapture(*args_clean, **kwargs)
         self._cached_frame = None
+        self.released = False
+        self.instances.append(self)
 
     def read(self):
         ret, frame = self._real_vc.read()
@@ -61,6 +66,10 @@ class MockLoopingVideoCapture:
     def __getattr__(self, name):
         return getattr(self._real_vc, name)
 
+    def release(self):
+        self.released = True
+        self._real_vc.release()
+
 
 @pytest.fixture(autouse=True)
 def patch_opencv_videocapture():
@@ -70,6 +79,7 @@ def patch_opencv_videocapture():
     module_path = OpenCVCamera.__module__
     target = f"{module_path}.cv2.VideoCapture"
 
+    MockLoopingVideoCapture.instances.clear()
     with patch(target, new=MockLoopingVideoCapture):
         yield
 
@@ -110,6 +120,9 @@ def test_connect_invalid_camera_path():
     with pytest.raises(ConnectionError):
         camera.connect(warmup=False)
 
+    assert camera.videocapture is None
+    assert MockLoopingVideoCapture.instances[-1].released
+
 
 def test_invalid_width_connect():
     config = OpenCVCameraConfig(
@@ -121,6 +134,35 @@ def test_invalid_width_connect():
     camera = OpenCVCamera(config)
     with pytest.raises(RuntimeError):
         camera.connect(warmup=False)
+
+    assert camera.videocapture is None
+    assert camera.thread is None
+    assert camera.stop_event is None
+    assert MockLoopingVideoCapture.instances[-1].released
+
+
+def test_warmup_failure_cleans_up_thread_and_capture():
+    config = OpenCVCameraConfig(index_or_path=DEFAULT_PNG_FILE_PATH, warmup_s=1)
+    camera = OpenCVCamera(config)
+
+    def _wait_until_stopped():
+        assert camera.stop_event is not None
+        camera.stop_event.wait(timeout=1)
+
+    with (
+        patch.object(camera, "_read_loop", side_effect=_wait_until_stopped) as read_loop,
+        patch.object(camera, "async_read", side_effect=TimeoutError("warmup failed")),
+        pytest.raises(TimeoutError, match="warmup failed"),
+    ):
+        camera.connect()
+
+    read_loop.assert_called_once_with()
+    assert camera.videocapture is None
+    assert camera.thread is None
+    assert camera.stop_event is None
+    assert camera.latest_frame is None
+    assert camera.latest_timestamp is None
+    assert MockLoopingVideoCapture.instances[-1].released
 
 
 @pytest.mark.parametrize("index_or_path", TEST_IMAGE_PATHS, ids=TEST_IMAGE_SIZES)
@@ -197,6 +239,20 @@ def test_read_latest():
 
         assert isinstance(latest, np.ndarray)
         assert latest.shape == frame.shape
+
+
+def test_read_latest_with_timestamp():
+    config = OpenCVCameraConfig(index_or_path=DEFAULT_PNG_FILE_PATH, warmup_s=0)
+
+    with OpenCVCamera(config) as camera:
+        frame = camera.read()
+        latest, timestamp = camera.read_latest_with_timestamp()
+
+        assert isinstance(latest, np.ndarray)
+        assert latest.shape == frame.shape
+        assert isinstance(timestamp, float)
+        assert timestamp > 0.0
+        assert timestamp == camera.latest_timestamp
 
 
 def test_read_latest_before_connect():

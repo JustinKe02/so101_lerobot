@@ -84,8 +84,8 @@ class OpenCVCamera(Camera):
         # Read 1 frame asynchronously (waits for new frame with a timeout)
         async_image = camera.async_read()
 
-        # Get the latest frame immediately (no wait, returns timestamp)
-        latest_image, timestamp = camera.read_latest()
+        # Get the latest frame immediately, together with its capture timestamp
+        latest_image, timestamp = camera.read_latest_with_timestamp()
 
         # When done, properly disconnect the camera using
         camera.disconnect()
@@ -155,28 +155,53 @@ class OpenCVCamera(Camera):
         # blocking in multi-threaded applications, especially during data collection.
         cv2.setNumThreads(1)
 
-        self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+        try:
+            self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
 
-        if not self.videocapture.isOpened():
-            self.videocapture.release()
-            self.videocapture = None
-            raise ConnectionError(
-                f"Failed to open {self}.Run `lerobot-find-cameras opencv` to find available cameras."
-            )
+            if not self.videocapture.isOpened():
+                raise ConnectionError(
+                    f"Failed to open {self}.Run `lerobot-find-cameras opencv` to find available cameras."
+                )
 
-        self._configure_capture_settings()
-        self._start_read_thread()
+            self._configure_capture_settings()
+            self._start_read_thread()
 
-        if warmup and self.warmup_s > 0:
-            start_time = time.time()
-            while time.time() - start_time < self.warmup_s:
-                self.async_read(timeout_ms=self.warmup_s * 1000)
-                time.sleep(0.1)
-            with self.frame_lock:
-                if self.latest_frame is None:
-                    raise ConnectionError(f"{self} failed to capture frames during warmup.")
+            if warmup and self.warmup_s > 0:
+                start_time = time.time()
+                while time.time() - start_time < self.warmup_s:
+                    self.async_read(timeout_ms=self.warmup_s * 1000)
+                    time.sleep(0.1)
+                with self.frame_lock:
+                    if self.latest_frame is None:
+                        raise ConnectionError(f"{self} failed to capture frames during warmup.")
+        except BaseException:
+            self._cleanup_after_failed_connect()
+            raise
 
         logger.info(f"{self} connected.")
+
+    def _cleanup_after_failed_connect(self) -> None:
+        """Best-effort rollback for resources acquired by ``connect``."""
+
+        try:
+            if self.thread is not None or self.stop_event is not None:
+                self._stop_read_thread()
+        except BaseException:
+            logger.exception("Failed to stop %s read thread during connection rollback.", self)
+
+        capture = self.videocapture
+        try:
+            if capture is not None:
+                capture.release()
+        except BaseException:
+            logger.exception("Failed to release %s capture during connection rollback.", self)
+        finally:
+            self.videocapture = None
+
+        with self.frame_lock:
+            self.latest_frame = None
+            self.latest_timestamp = None
+            self.new_frame_event.clear()
 
     @check_if_not_connected
     def _configure_capture_settings(self) -> None:
@@ -539,15 +564,16 @@ class OpenCVCamera(Camera):
         return frame
 
     @check_if_not_connected
-    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
-        """Return the most recent frame captured immediately (Peeking).
+    def read_latest_with_timestamp(self, max_age_ms: int = 500) -> tuple[NDArray[Any], float]:
+        """Return the most recent frame and its monotonic capture timestamp.
 
         This method is non-blocking and returns whatever is currently in the
         memory buffer. The frame may be stale,
         meaning it could have been captured a while ago (hanging camera scenario e.g.).
 
         Returns:
-            NDArray[Any]: The frame image (numpy array).
+            A ``(frame, timestamp)`` pair. ``timestamp`` uses the same
+            ``time.perf_counter`` clock as the asynchronous capture thread.
 
         Raises:
             TimeoutError: If the latest frame is older than `max_age_ms`.
@@ -571,6 +597,13 @@ class OpenCVCamera(Camera):
                 f"{self} latest frame is too old: {age_ms:.1f} ms (max allowed: {max_age_ms} ms)."
             )
 
+        return frame, timestamp
+
+    @check_if_not_connected
+    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
+        """Return the most recent buffered frame without its timestamp."""
+
+        frame, _ = self.read_latest_with_timestamp(max_age_ms=max_age_ms)
         return frame
 
     def disconnect(self) -> None:

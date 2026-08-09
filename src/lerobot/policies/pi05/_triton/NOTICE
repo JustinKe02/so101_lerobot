@@ -1,0 +1,8 @@
+The files pi0_infer.py, pi05_infer.py, and pi05rtc_infer.py are derived from:
+
+  https://github.com/dexmal/realtime-vla-v2
+  commit a36d02a7b241de1129af2048e749de58f95ead9c
+
+They are distributed under the MIT License included in this directory.
+LeRobot changes are limited to package-relative imports and RTC runtime
+correctness/configurability fixes documented in the surrounding source.

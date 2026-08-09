@@ -172,7 +172,7 @@ from lerobot.robots import (  # noqa: F401
     so_follower,
     unitree_g1 as unitree_g1_robot,
 )
-from lerobot.rollout import RolloutConfig, build_rollout_context, create_strategy
+from lerobot.rollout import RolloutConfig, RolloutPreflightResult, build_rollout_context, create_strategy
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -208,7 +208,8 @@ def rollout(cfg: RolloutConfig):
         set_seed(cfg.seed)
         logger.info("Rollout random seed: %d", cfg.seed)
 
-    if cfg.display_data:
+    preflight_only = bool(getattr(cfg, "preflight_only", False))
+    if cfg.display_data and not preflight_only:
         logger.info(
             "Initializing %s visualization (ip=%s, port=%s)",
             cfg.display_mode,
@@ -224,10 +225,19 @@ def rollout(cfg: RolloutConfig):
     try:
         signal_handler = ProcessSignalHandler(use_threads=True, display_pid=False)
         shutdown_event = signal_handler.shutdown_event
-        strategy = create_strategy(cfg.strategy)
+        if not preflight_only:
+            strategy = create_strategy(cfg.strategy)
 
         logger.info("Building rollout context...")
-        ctx = build_rollout_context(cfg, shutdown_event)
+        context_result = build_rollout_context(cfg, shutdown_event)
+        if isinstance(context_result, RolloutPreflightResult):
+            logger.info(
+                "Rollout preflight complete; no hardware was constructed: backend=%s artifacts=%s",
+                context_result.action_backend,
+                context_result.validated_artifacts,
+            )
+            return
+        ctx = context_result
         logger.info("Rollout strategy: %s", cfg.strategy.type)
         logger.info(
             "Robot: %s | FPS: %.0f | Duration: %s",
@@ -244,17 +254,33 @@ def rollout(cfg: RolloutConfig):
     except BaseException as exc:
         run_error = exc
     finally:
+        trace = getattr(ctx.policy, "trace", None) if ctx is not None else None
         if strategy is not None and ctx is not None:
             if run_error is not None:
                 # Teardown must treat the robot's pose as untrusted: hold
                 # torque instead of releasing it mid-motion.
                 ctx.hardware.abnormal_shutdown = True
+                mark_abnormal = getattr(trace, "mark_abnormal", None)
+                if callable(mark_abnormal):
+                    mark_abnormal(run_error)
             try:
                 strategy.teardown(ctx)
             except BaseException as exc:
                 cleanup_error = exc
                 logger.exception("Rollout teardown failed")
-        if cfg.display_data:
+        if trace is not None:
+            if cleanup_error is not None:
+                mark_abnormal = getattr(trace, "mark_abnormal", None)
+                if callable(mark_abnormal):
+                    mark_abnormal(cleanup_error)
+            try:
+                trace.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    logger.exception("Deployment trace finalization also failed")
+        if cfg.display_data and not preflight_only:
             try:
                 shutdown_visualization(cfg.display_mode)
             except BaseException as exc:

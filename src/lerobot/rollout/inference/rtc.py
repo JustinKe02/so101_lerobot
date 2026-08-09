@@ -29,9 +29,11 @@ import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from numbers import Real
 from threading import Event, Lock, RLock, Thread
 from typing import Any
 
+import numpy as np
 import torch
 
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -47,13 +49,29 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     PolicyProcessorPipeline,
     RelativeActionsProcessorStep,
+    TransitionKey,
+    create_transition,
 )
 from lerobot.utils.feature_utils import build_dataset_frame
 
+from ..realtime_executor import RealtimeExecutor
 from ..robot_wrapper import ThreadSafeRobot
+from ..speed_adapter import ROBOT_ACTION_COORDINATE_SPACE
+from ..stall_guard import StallContactError, StallContactGuard
+from ..time_axis import TimeAxisPlanner
+from ..trajectory import (
+    CommittedActionPrefill,
+    DelayAlignedTrajectory,
+    PrefillCapacityError,
+    RealtimeTraceWriteError,
+    RealtimeTraceWriter,
+    TimedRecord,
+)
 from .base import InferenceEngine
 
 logger = logging.getLogger(__name__)
+
+_EXECUTOR_TIMESTAMP_TOLERANCE_S = 1e-6
 
 # How long the RTC loop sleeps when paused, idle, or backpressured by a full queue.
 _RTC_IDLE_SLEEP_S: float = 0.01
@@ -125,6 +143,27 @@ class RTCPrefixHealthSnapshot:
     safety_stop_requested: bool
 
 
+@dataclass(frozen=True)
+class RTCExecutorControlSnapshot:
+    """Lock-consistent diagnostics from the independent executor heartbeat."""
+
+    heartbeat_count: int
+    dispatch_count: int
+    hold_count: int
+    queue_empty_count: int
+    deadline_miss_count: int
+    missed_periods: int
+    last_scheduled_timestamp: float | None
+    last_started_timestamp: float | None
+    last_finished_timestamp: float | None
+    last_lateness_s: float
+    last_execution_s: float
+    last_deadline_miss: bool
+    last_queue_empty: bool
+    last_command: tuple[float, ...] | None
+    last_applied_command: dict[str, Any] | None
+
+
 # ---------------------------------------------------------------------------
 # RTCInferenceEngine
 # ---------------------------------------------------------------------------
@@ -153,6 +192,7 @@ class RTCInferenceEngine(InferenceEngine):
         use_torch_compile: bool = False,
         compile_warmup_inferences: int = 2,
         rtc_queue_threshold: int = 30,
+        rtc_inference_mode: str = "guided",
         rtc_timing_mode: str = "legacy",
         guidance_delay_mode: str = "legacy_max",
         fixed_guidance_delay_steps: int = 5,
@@ -167,7 +207,22 @@ class RTCInferenceEngine(InferenceEngine):
         prefix_health_severe_residual_threshold: float = 5.0,
         prefix_health_consecutive_severe: int = 3,
         prefix_health_safety_stop_replans: int = 0,
+        dynamic_prefill_enabled: bool = False,
+        image_capture_delay_s: float = 0.0,
+        camera_capture_delay_s: dict[str, float] | None = None,
+        state_observation_delay_s: float = 0.0,
+        max_prefill_steps: int = 0,
+        max_camera_skew_s: float = 0.05,
+        prefill_overflow: str = "error",
         shutdown_event: Event | None = None,
+        time_axis_planner: TimeAxisPlanner | None = None,
+        trace: RealtimeTraceWriter | None = None,
+        trajectory: DelayAlignedTrajectory | None = None,
+        realtime_executor: RealtimeExecutor | None = None,
+        ordered_action_keys: list[str] | None = None,
+        robot_action_processor: Any | None = None,
+        action_filter: Any | None = None,
+        stall_guard: StallContactGuard | None = None,
     ) -> None:
         if rtc_queue_threshold < 0:
             raise ValueError("RTC queue threshold must be non-negative")
@@ -185,6 +240,8 @@ class RTCInferenceEngine(InferenceEngine):
             )
         if rtc_timing_mode not in ("legacy", "actual_consumed"):
             raise ValueError(f"Unsupported RTC timing mode: {rtc_timing_mode!r}")
+        if rtc_inference_mode not in ("guided", "trained_prefix"):
+            raise ValueError(f"Unsupported RTC inference mode: {rtc_inference_mode!r}")
         if rtc_timing_mode == "legacy" and guidance_delay_mode != "legacy_max":
             raise ValueError("legacy RTC timing requires guidance_delay_mode='legacy_max'")
         if enforce_guided_execution_window and rtc_timing_mode != "actual_consumed":
@@ -212,6 +269,32 @@ class RTCInferenceEngine(InferenceEngine):
             raise ValueError("RTC prefix health consecutive severe count must be positive")
         if prefix_health_safety_stop_replans < 0:
             raise ValueError("RTC prefix health safety stop replans must be non-negative")
+        if dynamic_prefill_enabled and rtc_inference_mode != "trained_prefix":
+            raise ValueError("RTC dynamic prefill requires inference_mode='trained_prefix'")
+        if dynamic_prefill_enabled and rtc_timing_mode != "actual_consumed":
+            raise ValueError("RTC dynamic prefill requires timing_mode='actual_consumed'")
+        if prefill_overflow not in ("error", "truncate_oldest"):
+            raise ValueError(f"Unsupported RTC prefill overflow mode: {prefill_overflow!r}")
+        for name, value in (
+            ("image_capture_delay_s", image_capture_delay_s),
+            ("state_observation_delay_s", state_observation_delay_s),
+            ("max_camera_skew_s", max_camera_skew_s),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"RTC {name} must be finite and non-negative")
+        resolved_camera_delays: dict[str, float] = {}
+        for camera_key, value in (camera_capture_delay_s or {}).items():
+            if not isinstance(camera_key, str) or not camera_key.strip():
+                raise ValueError("RTC camera capture delay keys must be non-empty strings")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"RTC camera capture delay for {camera_key!r} must be numeric")
+            if not math.isfinite(float(value)) or float(value) < 0.0:
+                raise ValueError(
+                    f"RTC camera capture delay for {camera_key!r} must be finite and non-negative"
+                )
+            resolved_camera_delays[camera_key] = float(value)
+        if isinstance(max_prefill_steps, bool) or max_prefill_steps < 0:
+            raise ValueError("RTC max_prefill_steps must be a non-negative integer")
 
         self._policy = policy
         self._preprocessor = preprocessor
@@ -225,6 +308,12 @@ class RTCInferenceEngine(InferenceEngine):
         self._use_torch_compile = use_torch_compile
         self._compile_warmup_inferences = compile_warmup_inferences
         self._rtc_queue_threshold = rtc_queue_threshold
+        self._rtc_inference_mode = rtc_inference_mode
+        self._rtc_training_max_delay = int(
+            getattr(getattr(policy, "config", None), "rtc_training_max_delay", 0)
+        )
+        if self._rtc_inference_mode == "trained_prefix" and self._rtc_training_max_delay <= 0:
+            raise ValueError("trained_prefix RTC mode requires policy.config.rtc_training_max_delay > 0")
         self._policy_chunk_size = policy_chunk_size
         self._rtc_timing_mode = rtc_timing_mode
         self._guidance_delay_mode = guidance_delay_mode
@@ -240,6 +329,32 @@ class RTCInferenceEngine(InferenceEngine):
         self._prefix_health_severe_residual_threshold = prefix_health_severe_residual_threshold
         self._prefix_health_consecutive_severe = prefix_health_consecutive_severe
         self._prefix_health_safety_stop_replans = prefix_health_safety_stop_replans
+        self._dynamic_prefill_enabled = dynamic_prefill_enabled
+        self._image_capture_delay_s = float(image_capture_delay_s)
+        self._camera_capture_delay_s = resolved_camera_delays
+        self._state_observation_delay_s = float(state_observation_delay_s)
+        self._max_prefill_steps = int(max_prefill_steps) or self._rtc_training_max_delay
+        self._max_camera_skew_s = float(max_camera_skew_s)
+        self._prefill_overflow = prefill_overflow
+        if self._dynamic_prefill_enabled and self._max_prefill_steps > self._rtc_training_max_delay:
+            raise ValueError(
+                "RTC max prefill steps exceed checkpoint training capacity: "
+                f"requested={self._max_prefill_steps}, capacity={self._rtc_training_max_delay}"
+            )
+        self._time_axis_planner = time_axis_planner
+        self._trace = trace
+        self._trajectory = trajectory
+        self._realtime_executor = realtime_executor
+        self._robot_action_processor = robot_action_processor
+        self._action_filter = action_filter
+        self._stall_guard = stall_guard
+        self._realtime_executor_needs_reset = realtime_executor is not None
+        self._executor_last_observation_timestamp: float | None = None
+        self._action_keys = list(ordered_action_keys or ())
+        if not self._action_keys:
+            self._action_keys = [key for key in robot_wrapper.action_features if key.endswith(".pos")]
+        if not self._action_keys:
+            self._action_keys = list(robot_wrapper.action_features)
 
         self._action_queue: ActionQueue | None = None
         self._obs_holder: dict[str, Any] = {}
@@ -256,6 +371,28 @@ class RTCInferenceEngine(InferenceEngine):
         self._fatal_error: BaseException | None = None
         self._global_shutdown_event = shutdown_event
         self._rtc_thread: Thread | None = None
+        self._executor_thread: Thread | None = None
+        self._executor_state_lock = RLock()
+        self._executor_cycle_lock = RLock()
+        self._executor_postfix_not_before_heartbeat: int | None = None
+        self._executor_applied_heartbeat_count = 0
+        self._executor_metrics_lock = Lock()
+        self._latest_dispatched_action: torch.Tensor | None = None
+        self._executor_heartbeat_count = 0
+        self._executor_dispatch_count = 0
+        self._executor_hold_count = 0
+        self._executor_queue_empty_count = 0
+        self._executor_deadline_miss_count = 0
+        self._executor_missed_periods = 0
+        self._executor_last_scheduled_timestamp: float | None = None
+        self._executor_last_started_timestamp: float | None = None
+        self._executor_last_finished_timestamp: float | None = None
+        self._executor_last_lateness_s = 0.0
+        self._executor_last_execution_s = 0.0
+        self._executor_last_deadline_miss = False
+        self._executor_last_queue_empty = False
+        self._executor_last_command: tuple[float, ...] | None = None
+        self._executor_last_applied_command: dict[str, Any] | None = None
         self._prefix_health_lock = Lock()
         self._prefix_health_replan_event = Event()
         self._prefix_health_stop_event = Event()
@@ -276,6 +413,18 @@ class RTCInferenceEngine(InferenceEngine):
             self._timing_diagnostics,
             self._enforce_guided_execution_window,
         )
+        logger.info("RTC inference mode=%s", self._rtc_inference_mode)
+        if self._dynamic_prefill_enabled:
+            logger.info(
+                "RTC dynamic prefill enabled: max_steps=%d image_delay_ms=%.3f "
+                "state_delay_ms=%.3f overflow=%s",
+                self._max_prefill_steps,
+                self._image_capture_delay_s * 1000.0,
+                self._state_observation_delay_s * 1000.0,
+                self._prefill_overflow,
+            )
+        if self._time_axis_planner is not None:
+            logger.info("RTC time-axis planner enabled")
         if self._rtc_timing_mode == "actual_consumed" and self._policy_chunk_size is not None:
             nominal_replan_steps = self._policy_chunk_size - self._rtc_queue_threshold
             logger.info(
@@ -333,8 +482,38 @@ class RTCInferenceEngine(InferenceEngine):
         """The shared action queue between the RTC thread and the main loop."""
         return self._action_queue
 
+    @property
+    def owns_action_dispatch(self) -> bool:
+        """The realtime executor sends commands from an independent heartbeat."""
+
+        return self._realtime_executor is not None
+
+    def executor_control_snapshot(self) -> RTCExecutorControlSnapshot:
+        with self._executor_metrics_lock:
+            return RTCExecutorControlSnapshot(
+                heartbeat_count=self._executor_heartbeat_count,
+                dispatch_count=self._executor_dispatch_count,
+                hold_count=self._executor_hold_count,
+                queue_empty_count=self._executor_queue_empty_count,
+                deadline_miss_count=self._executor_deadline_miss_count,
+                missed_periods=self._executor_missed_periods,
+                last_scheduled_timestamp=self._executor_last_scheduled_timestamp,
+                last_started_timestamp=self._executor_last_started_timestamp,
+                last_finished_timestamp=self._executor_last_finished_timestamp,
+                last_lateness_s=self._executor_last_lateness_s,
+                last_execution_s=self._executor_last_execution_s,
+                last_deadline_miss=self._executor_last_deadline_miss,
+                last_queue_empty=self._executor_last_queue_empty,
+                last_command=self._executor_last_command,
+                last_applied_command=(
+                    None
+                    if self._executor_last_applied_command is None
+                    else dict(self._executor_last_applied_command)
+                ),
+            )
+
     def start(self) -> None:
-        """Launch the RTC background thread."""
+        """Launch inference and, when enabled, fixed-heartbeat control threads."""
         self._action_queue = ActionQueue(self._rtc_config)
         with self._obs_lock:
             self._obs_holder = {
@@ -342,8 +521,15 @@ class RTCInferenceEngine(InferenceEngine):
                 "observation_epoch": self._observation_epoch,
                 "observation_sequence": self._observation_sequence,
                 "robot_type": self._robot.robot_type,
+                "observation_timing": None,
+                "control_observation": None,
+                "control_state": None,
+                "control_state_timestamp": None,
             }
         self._shutdown_event.clear()
+        self._reset_executor_control_metrics()
+        self._executor_postfix_not_before_heartbeat = None
+        self._executor_applied_heartbeat_count = 0
         self._rtc_thread = Thread(
             target=self._rtc_loop,
             daemon=True,
@@ -351,29 +537,58 @@ class RTCInferenceEngine(InferenceEngine):
         )
         self._rtc_thread.start()
         logger.info("RTC inference thread started")
+        if self._realtime_executor is not None:
+            self._executor_thread = Thread(
+                target=self._executor_control_loop,
+                daemon=True,
+                name="RTCExecutorControl",
+            )
+            self._executor_thread.start()
+            logger.info(
+                "RTC independent executor thread started (heartbeat=%.6fs)",
+                self._realtime_executor.config.heartbeat_dt_s,
+            )
 
     def stop(self) -> None:
-        """Signal the RTC thread to stop and wait for it."""
-        logger.info("Stopping RTC inference thread...")
+        """Signal all RTC threads to stop and wait for them."""
+        logger.info("Stopping RTC inference/control threads...")
         self._shutdown_event.set()
         self._policy_active.clear()
-        thread = self._rtc_thread
-        if thread is None:
-            return
-        if thread.is_alive():
-            thread.join(timeout=_RTC_JOIN_TIMEOUT_S)
-        if thread.is_alive():
-            error = TimeoutError(f"RTC thread did not stop within {_RTC_JOIN_TIMEOUT_S:.1f}s")
+        alive_threads: list[str] = []
+        for label, thread in (
+            ("executor control", self._executor_thread),
+            ("inference", self._rtc_thread),
+        ):
+            if thread is None:
+                continue
+            if thread.is_alive():
+                thread.join(timeout=_RTC_JOIN_TIMEOUT_S)
+            if thread.is_alive():
+                alive_threads.append(label)
+            else:
+                logger.info("RTC %s thread stopped", label)
+        if alive_threads:
+            error = TimeoutError(
+                "RTC threads did not stop within the join timeout: " + ", ".join(alive_threads)
+            )
             logger.error("%s", error)
             self._enter_fatal_state(error)
+        elif self.failed and self._trace is not None:
+            mark_abnormal = getattr(self._trace, "mark_abnormal", None)
+            if callable(mark_abnormal):
+                mark_abnormal(self._fatal_error)
+        if alive_threads:
             return
-        logger.info("RTC inference thread stopped")
         self._rtc_thread = None
+        self._executor_thread = None
 
     def pause(self) -> None:
-        """Pause the RTC background thread."""
-        logger.info("Pausing RTC inference thread")
+        """Pause inference and wait for an in-flight executor dispatch."""
+        logger.info("Pausing RTC inference/control threads")
         self._policy_active.clear()
+        if self._realtime_executor is not None:
+            with self._executor_cycle_lock, self._action_dispatch_lock:
+                pass
 
     def resume(self) -> None:
         """Resume the RTC background thread."""
@@ -383,14 +598,36 @@ class RTCInferenceEngine(InferenceEngine):
     def reset(self) -> None:
         """Reset the policy, processors, and action queue."""
         logger.info("Resetting RTC inference state (policy + processors + queue)")
-        with self._inference_lock:
+        self.pause()
+        with self._executor_cycle_lock, self._inference_lock:
             with self._obs_lock:
                 self._observation_epoch += 1
                 self._obs_holder["obs"] = None
+                self._obs_holder["observation_timing"] = None
+                self._obs_holder["executor_state"] = None
+                self._obs_holder["executor_state_timestamp"] = None
+                self._obs_holder["control_observation"] = None
+                self._obs_holder["control_state"] = None
+                self._obs_holder["control_state_timestamp"] = None
                 self._obs_holder["observation_epoch"] = self._observation_epoch
             self._policy.reset()
             self._preprocessor.reset()
             self._postprocessor.reset()
+            if self._trajectory is not None:
+                self._trajectory.reset()
+            if self._realtime_executor is not None:
+                with self._executor_state_lock:
+                    self._realtime_executor.clear_waypoints()
+                    self._realtime_executor_needs_reset = True
+                    self._executor_last_observation_timestamp = None
+                    self._executor_postfix_not_before_heartbeat = None
+                    self._executor_applied_heartbeat_count = 0
+                    self._latest_dispatched_action = None
+                    if self._action_filter is not None:
+                        self._action_filter.reset()
+                    if self._stall_guard is not None:
+                        self._stall_guard.reset()
+                    self._reset_executor_control_metrics()
             self._reset_prefix_health_state()
             if self._action_queue is not None:
                 self._action_queue.clear()
@@ -400,15 +637,30 @@ class RTCInferenceEngine(InferenceEngine):
     # ------------------------------------------------------------------
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
-        """Pop the next action from the RTC queue (ignores ``obs_frame``)."""
+        """Return the next action, or the latest independently dispatched command."""
         if (
             self._rtc_error.is_set()
             or self._prefix_health_stop_event.is_set()
             or self._prefix_health_replan_event.is_set()
         ):
             return None
+        if self._realtime_executor is not None and self._executor_thread is not None:
+            with self._executor_state_lock:
+                return (
+                    None if self._latest_dispatched_action is None else self._latest_dispatched_action.clone()
+                )
+        action, _ = self._dequeue_action()
+        if action is not None and self._realtime_executor is not None:
+            try:
+                action = self._smooth_realtime_action(action)
+            except Exception as exc:
+                self._enter_fatal_state(_RTCFatalError(f"Realtime executor failed: {exc}"))
+                return None
+        return action
+
+    def _dequeue_action(self) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if self._action_queue is None:
-            return None
+            return None, None
         if self._enforce_guided_execution_window:
             snapshot = self._action_queue.snapshot()
             next_model_index = snapshot.next_model_action_index
@@ -420,28 +672,465 @@ class RTCInferenceEngine(InferenceEngine):
                         f"execution_horizon={self._rtc_config.execution_horizon}"
                     )
                 )
-                return None
-        if self._rtc_timing_mode == "actual_consumed" and self._timing_diagnostics:
-            pop_result = self._action_queue.get_with_diagnostics()
-            action = pop_result.action
-            if action is not None:
-                logger.debug(
-                    "RTC action dequeue: source_chunk_generation=%s model_action_index=%s "
-                    "total_consumed=%d queue_remaining=%d",
-                    pop_result.source_chunk_generation,
-                    pop_result.model_action_index,
-                    pop_result.total_consumed,
-                    pop_result.queue_size_after,
-                )
-        else:
-            action = self._action_queue.get()
+                return None, None
+        pop_result = self._action_queue.get_with_diagnostics()
+        action = pop_result.action
+        if action is not None and self._rtc_timing_mode == "actual_consumed" and self._timing_diagnostics:
+            logger.debug(
+                "RTC action dequeue: source_chunk_generation=%s model_action_index=%s "
+                "total_consumed=%d queue_remaining=%d",
+                pop_result.source_chunk_generation,
+                pop_result.model_action_index,
+                pop_result.total_consumed,
+                pop_result.queue_size_after,
+            )
         if (
             self._rtc_error.is_set()
             or self._prefix_health_stop_event.is_set()
             or self._prefix_health_replan_event.is_set()
         ):
-            return None
-        return action
+            return None, pop_result.processed_leftover
+        return action, pop_result.processed_leftover
+
+    def _smooth_realtime_action(self, action: torch.Tensor) -> torch.Tensor:
+        executor = self._realtime_executor
+        queue = self._action_queue
+        if executor is None or queue is None:
+            return action
+
+        with self._obs_lock:
+            state = self._obs_holder.get("executor_state")
+            state_timestamp = self._obs_holder.get("executor_state_timestamp")
+        state_tensor = None
+        if isinstance(state, torch.Tensor) and state.numel() == len(self._action_keys):
+            state_tensor = state.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+
+        now = self._monotonic_seconds()
+        if self._realtime_executor_needs_reset or not executor.initialized:
+            initial = (
+                state_tensor.numpy()
+                if state_tensor is not None
+                else action.detach().to(device="cpu", dtype=torch.float64).numpy()
+            )
+            observation_stamp = (
+                float(state_timestamp)
+                if isinstance(state_timestamp, Real) and math.isfinite(float(state_timestamp))
+                else now
+            )
+            observation_stamp = min(observation_stamp, now)
+            executor.reset(
+                initial,
+                timestamp=now,
+                observation_timestamp=observation_stamp,
+            )
+            self._executor_last_observation_timestamp = observation_stamp
+            self._realtime_executor_needs_reset = False
+
+        tick_timestamp = executor.next_heartbeat_timestamp
+        if tick_timestamp is None:
+            raise RuntimeError("realtime executor has no heartbeat timestamp after reset")
+        snapshot = queue.snapshot()
+        current = action.detach().to(device="cpu", dtype=torch.float64).reshape(1, -1)
+        future = snapshot.processed_leftover
+        if future is not None and len(future) > 0:
+            future = future.detach().to(device="cpu", dtype=torch.float64)
+            waypoints = torch.cat((current, future), dim=0)
+        else:
+            waypoints = current
+        waypoint_timestamps = (
+            tick_timestamp
+            + torch.arange(len(waypoints), dtype=torch.float64) * executor.config.heartbeat_dt_s
+        )
+        executor.replace_waypoints_from(
+            tick_timestamp,
+            waypoint_timestamps.numpy(),
+            waypoints.numpy(),
+        )
+
+        observation = None
+        observation_stamp = None
+        if (
+            state_tensor is not None
+            and isinstance(state_timestamp, Real)
+            and math.isfinite(float(state_timestamp))
+        ):
+            candidate_stamp = min(float(state_timestamp), tick_timestamp)
+            if (
+                self._executor_last_observation_timestamp is None
+                or candidate_stamp >= self._executor_last_observation_timestamp
+            ):
+                observation = state_tensor.numpy()
+                observation_stamp = candidate_stamp
+                self._executor_last_observation_timestamp = candidate_stamp
+
+        command = executor.heartbeat(
+            observation,
+            observation_timestamp=observation_stamp,
+        )
+        if self._trace is not None:
+            self._trace.write(
+                "smooth_execution",
+                heartbeat_timestamp=executor.last_heartbeat_timestamp,
+                model_target=action,
+                reference=executor.last_reference,
+                command=command,
+                lookahead_steps=len(waypoints),
+                queue_remaining=snapshot.queue_size,
+                underrun=executor.last_tick_was_underrun,
+                underrun_count=executor.underrun_count,
+                observed_state=observation,
+                observed_state_timestamp=observation_stamp,
+            )
+        return torch.as_tensor(command, dtype=action.dtype, device=action.device)
+
+    def _reset_executor_control_metrics(self) -> None:
+        with self._executor_metrics_lock:
+            self._executor_heartbeat_count = 0
+            self._executor_dispatch_count = 0
+            self._executor_hold_count = 0
+            self._executor_queue_empty_count = 0
+            self._executor_deadline_miss_count = 0
+            self._executor_missed_periods = 0
+            self._executor_last_scheduled_timestamp = None
+            self._executor_last_started_timestamp = None
+            self._executor_last_finished_timestamp = None
+            self._executor_last_lateness_s = 0.0
+            self._executor_last_execution_s = 0.0
+            self._executor_last_deadline_miss = False
+            self._executor_last_queue_empty = False
+            self._executor_last_command = None
+            self._executor_last_applied_command = None
+
+    def _executor_control_loop(self) -> None:
+        executor = self._realtime_executor
+        if executor is None:
+            return
+        heartbeat_dt = executor.config.heartbeat_dt_s
+        deadline_tolerance = max(0.001, heartbeat_dt * 0.1)
+        schedule_origin: float | None = None
+        schedule_tick = 0
+        try:
+            while not self._shutdown_event.is_set():
+                if not self._policy_active.is_set():
+                    self._policy_active.wait(timeout=_RTC_IDLE_SLEEP_S)
+                    schedule_origin = None
+                    schedule_tick = 0
+                    continue
+
+                now = self._monotonic_seconds()
+                if schedule_origin is None:
+                    schedule_origin = now
+                    schedule_tick = 0
+                next_deadline = schedule_origin + schedule_tick * heartbeat_dt
+                wait_s = next_deadline - now
+                if wait_s > 0.0:
+                    self._shutdown_event.wait(timeout=min(wait_s, _RTC_IDLE_SLEEP_S))
+                    continue
+
+                scheduled = next_deadline
+                missed_periods = self._run_executor_control_cycle(
+                    scheduled,
+                    heartbeat_dt=heartbeat_dt,
+                    deadline_tolerance=deadline_tolerance,
+                )
+                if missed_periods:
+                    schedule_origin = scheduled + (missed_periods + 1) * heartbeat_dt
+                    schedule_tick = 0
+                else:
+                    schedule_tick += 1
+        except BaseException as exc:
+            logger.error("RTC executor control thread failed:\n%s", traceback.format_exc())
+            self._enter_fatal_state(_RTCFatalError(f"Realtime executor control failed: {exc}"))
+
+    def _run_executor_control_cycle(
+        self,
+        scheduled: float,
+        *,
+        heartbeat_dt: float,
+        deadline_tolerance: float,
+    ) -> int:
+        with self._executor_cycle_lock:
+            started = self._monotonic_seconds()
+            outcome = self._run_executor_control_tick(scheduled)
+            finished = self._monotonic_seconds()
+            nominal_next = scheduled + heartbeat_dt
+            missed_periods = 0
+            if finished > nominal_next:
+                missed_periods = int(math.floor((finished - nominal_next) / heartbeat_dt)) + 1
+            lateness = max(0.0, started - scheduled)
+            execution_s = max(0.0, finished - started)
+            deadline_miss = lateness > deadline_tolerance or execution_s > heartbeat_dt or missed_periods > 0
+            self._record_executor_control_outcome(
+                outcome,
+                scheduled=scheduled,
+                started=started,
+                finished=finished,
+                lateness=lateness,
+                execution_s=execution_s,
+                deadline_miss=deadline_miss,
+                missed_periods=missed_periods,
+            )
+            return missed_periods
+
+    def _run_executor_control_tick(self, scheduled_timestamp: float) -> dict[str, Any]:
+        executor = self._realtime_executor
+        queue = self._action_queue
+        if executor is None or queue is None:
+            return {"heartbeat": False, "dispatched": False, "reason": "not_initialized"}
+
+        with self._action_dispatch_lock:
+            if not self._executor_dispatch_allowed():
+                return {"heartbeat": False, "dispatched": False, "reason": "inactive_or_failed"}
+            with self._executor_state_lock:
+                with self._obs_lock:
+                    raw_observation = self._obs_holder.get("control_observation")
+                    state = self._obs_holder.get("control_state")
+                    state_timestamp = self._obs_holder.get("control_state_timestamp")
+                    if state is None:
+                        state = self._obs_holder.get("executor_state")
+                        state_timestamp = self._obs_holder.get("executor_state_timestamp")
+                raw_observation = dict(raw_observation) if isinstance(raw_observation, dict) else {}
+                state_tensor = None
+                if isinstance(state, torch.Tensor) and state.numel() == len(self._action_keys):
+                    state_tensor = state.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+
+                if self._realtime_executor_needs_reset or not executor.initialized:
+                    if state_tensor is None:
+                        return {"heartbeat": False, "dispatched": False, "reason": "no_control_state"}
+                    observation_stamp = (
+                        float(state_timestamp)
+                        if isinstance(state_timestamp, Real) and math.isfinite(float(state_timestamp))
+                        else scheduled_timestamp
+                    )
+                    observation_stamp = min(observation_stamp, scheduled_timestamp)
+                    executor.reset(
+                        state_tensor.numpy(),
+                        timestamp=scheduled_timestamp,
+                        observation_timestamp=observation_stamp,
+                    )
+                    self._executor_last_observation_timestamp = observation_stamp
+                    self._realtime_executor_needs_reset = False
+                else:
+                    next_heartbeat = executor.next_heartbeat_timestamp
+                    if next_heartbeat is None:
+                        raise RuntimeError("realtime executor has no next heartbeat")
+                    tolerance = max(
+                        _EXECUTOR_TIMESTAMP_TOLERANCE_S,
+                        executor.config.heartbeat_dt_s * 1e-6,
+                    )
+                    if scheduled_timestamp > next_heartbeat + tolerance:
+                        executor.rebase_next_heartbeat(scheduled_timestamp)
+                    elif scheduled_timestamp + tolerance < next_heartbeat:
+                        raise RuntimeError(
+                            "executor control schedule moved backwards: "
+                            f"scheduled={scheduled_timestamp:.9f}, executor={next_heartbeat:.9f}"
+                        )
+
+                completed_heartbeats = self._executor_applied_heartbeat_count
+                barrier = self._executor_postfix_not_before_heartbeat
+                barrier_ready = barrier is None or completed_heartbeats >= barrier
+                if barrier is not None and barrier_ready:
+                    self._executor_postfix_not_before_heartbeat = None
+                allow_queue = self.ready and barrier_ready
+                if not self.ready:
+                    executor.clear_waypoints()
+                action = None
+                future = None
+                if allow_queue:
+                    action, future = self._dequeue_action()
+
+                tick_timestamp = executor.next_heartbeat_timestamp
+                if tick_timestamp is None:
+                    raise RuntimeError("realtime executor lost its heartbeat timestamp")
+                observation = None
+                observation_stamp = None
+                if state_tensor is not None and isinstance(state_timestamp, Real):
+                    candidate_stamp = min(float(state_timestamp), tick_timestamp)
+                    if math.isfinite(candidate_stamp) and (
+                        self._executor_last_observation_timestamp is None
+                        or candidate_stamp >= self._executor_last_observation_timestamp
+                    ):
+                        observation = state_tensor.numpy()
+                        observation_stamp = candidate_stamp
+                        self._executor_last_observation_timestamp = candidate_stamp
+
+                lookahead_steps = 0
+                if action is not None:
+                    current = action.detach().to(device="cpu", dtype=torch.float64).reshape(1, -1)
+                    if future is not None and len(future) > 0:
+                        future = future.detach().to(device="cpu", dtype=torch.float64)
+                        waypoints = torch.cat((current, future), dim=0)
+                    else:
+                        waypoints = current
+                    waypoint_timestamps = (
+                        tick_timestamp
+                        + torch.arange(len(waypoints), dtype=torch.float64) * executor.config.heartbeat_dt_s
+                    )
+                    command = executor.control_step(
+                        tick_timestamp,
+                        waypoint_timestamps.numpy(),
+                        waypoints.numpy(),
+                        observation,
+                        observation_timestamp=observation_stamp,
+                    )
+                    lookahead_steps = len(waypoints)
+                else:
+                    command = executor.heartbeat(
+                        observation,
+                        observation_timestamp=observation_stamp,
+                    )
+
+                command_tensor = torch.as_tensor(command, dtype=torch.float32)
+                command_dict = {key: float(command[index]) for index, key in enumerate(self._action_keys)}
+                processed = (
+                    command_dict
+                    if self._robot_action_processor is None
+                    else self._robot_action_processor((command_dict, raw_observation))
+                )
+                if not isinstance(processed, dict):
+                    raise TypeError("robot_action_processor must return an action dictionary")
+                pre_filter = dict(processed)
+                if self._action_filter is not None:
+                    processed = self._action_filter.apply(processed, raw_observation)
+                if not self._executor_dispatch_allowed():
+                    return {
+                        "heartbeat": True,
+                        "dispatched": False,
+                        "reason": "paused_or_failed_before_send",
+                        "queue_empty": action is None,
+                        "underrun": executor.last_tick_was_underrun,
+                        "command": command,
+                    }
+
+                sent = self._robot.send_action(processed)
+                self._executor_applied_heartbeat_count += 1
+                self._latest_dispatched_action = command_tensor
+                self.notify_action_result(processed, sent, raw_observation)
+                if self._trace is not None:
+                    self._trace.write(
+                        "smooth_execution",
+                        heartbeat_timestamp=executor.last_heartbeat_timestamp,
+                        model_target=action,
+                        reference=executor.last_reference,
+                        command=command,
+                        applied_command=sent,
+                        lookahead_steps=lookahead_steps,
+                        queue_remaining=queue.qsize(),
+                        queue_empty=action is None,
+                        underrun=executor.last_tick_was_underrun,
+                        underrun_count=executor.underrun_count,
+                        observed_state=observation,
+                        observed_state_timestamp=observation_stamp,
+                    )
+                    self._trace.write(
+                        "dispatch",
+                        raw_model_action=command_dict,
+                        pre_filter_target=pre_filter,
+                        filtered_target=processed,
+                        applied_command=sent,
+                        observed_state=raw_observation,
+                        dispatch_owner="rtc_executor_control",
+                    )
+                if self._stall_guard is not None:
+                    try:
+                        self._stall_guard.observe(processed, sent)
+                    except StallContactError:
+                        self._hold_after_stall(processed, raw_observation)
+                        raise
+                return {
+                    "heartbeat": True,
+                    "dispatched": True,
+                    "queue_empty": action is None,
+                    "underrun": executor.last_tick_was_underrun,
+                    "command": command,
+                    "applied_command": sent,
+                    "queue_remaining": queue.qsize(),
+                }
+
+    def _executor_dispatch_allowed(self) -> bool:
+        return self._policy_active.is_set() and not (
+            self._shutdown_event.is_set()
+            or self._rtc_error.is_set()
+            or self._prefix_health_replan_event.is_set()
+            or self._prefix_health_stop_event.is_set()
+        )
+
+    def _hold_after_stall(self, requested: dict[str, Any], observation: dict[str, Any]) -> None:
+        hold = {
+            key: float(observation[key])
+            for key in requested
+            if isinstance(observation.get(key), (int, float))
+        }
+        if not hold:
+            logger.error("No present positions available for realtime-executor stall hold")
+            return
+        try:
+            self._robot.send_action(hold)
+            if self._trace is not None:
+                self._trace.write("stall_hold", requested=requested, applied_command=hold)
+        except Exception:
+            logger.exception("Failed to command hold after realtime-executor stall")
+
+    def _record_executor_control_outcome(
+        self,
+        outcome: dict[str, Any],
+        *,
+        scheduled: float,
+        started: float,
+        finished: float,
+        lateness: float,
+        execution_s: float,
+        deadline_miss: bool,
+        missed_periods: int,
+    ) -> None:
+        heartbeat = outcome.get("heartbeat") is True
+        dispatched = outcome.get("dispatched") is True
+        queue_empty = outcome.get("queue_empty") is True
+        underrun = outcome.get("underrun") is True
+        command = outcome.get("command")
+        command_tuple = (
+            None if command is None else tuple(float(value) for value in np.asarray(command).reshape(-1))
+        )
+        applied = outcome.get("applied_command")
+        applied_mapping = dict(applied) if isinstance(applied, dict) else None
+        with self._executor_metrics_lock:
+            self._executor_heartbeat_count += int(heartbeat)
+            self._executor_dispatch_count += int(dispatched)
+            self._executor_hold_count += int(underrun)
+            self._executor_queue_empty_count += int(queue_empty)
+            self._executor_deadline_miss_count += int(deadline_miss)
+            self._executor_missed_periods += missed_periods
+            self._executor_last_scheduled_timestamp = scheduled
+            self._executor_last_started_timestamp = started
+            self._executor_last_finished_timestamp = finished
+            self._executor_last_lateness_s = lateness
+            self._executor_last_execution_s = execution_s
+            self._executor_last_deadline_miss = deadline_miss
+            self._executor_last_queue_empty = queue_empty
+            self._executor_last_command = command_tuple
+            self._executor_last_applied_command = applied_mapping
+            heartbeat_count = self._executor_heartbeat_count
+            deadline_miss_count = self._executor_deadline_miss_count
+        if self._trace is not None:
+            self._trace.write(
+                "executor_control",
+                scheduled_timestamp=scheduled,
+                started_timestamp=started,
+                finished_timestamp=finished,
+                lateness_s=lateness,
+                execution_s=execution_s,
+                deadline_miss=deadline_miss,
+                deadline_miss_count=deadline_miss_count,
+                missed_periods=missed_periods,
+                heartbeat_count=heartbeat_count,
+                heartbeat=heartbeat,
+                dispatched=dispatched,
+                queue_empty=queue_empty,
+                underrun=underrun,
+                command=command,
+                applied_command=applied,
+                reason=outcome.get("reason"),
+            )
 
     @contextmanager
     def action_dispatch_guard(self) -> Iterator[bool]:
@@ -453,16 +1142,243 @@ class RTCInferenceEngine(InferenceEngine):
                 or self._prefix_health_replan_event.is_set()
             )
 
+    @staticmethod
+    def _monotonic_seconds() -> float:
+        monotonic_ns = getattr(time, "monotonic_ns", None)
+        if callable(monotonic_ns):
+            return monotonic_ns() * 1e-9
+        return time.perf_counter()
+
+    @staticmethod
+    def _numeric_values(record: dict) -> dict[str, float]:
+        return {
+            key: float(value)
+            for key, value in record.items()
+            if isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(float(value))
+        }
+
+    def _observation_timing(self) -> dict[str, Any]:
+        timing = getattr(self._robot, "last_observation_timing", None)
+        if callable(timing):
+            timing = timing()
+        if not isinstance(timing, dict):
+            now = self._monotonic_seconds()
+            return {
+                "clock": "monotonic",
+                "state_timestamp": now,
+                "camera_timestamps": {},
+                "observation_timestamp": now,
+            }
+        return dict(timing)
+
+    def _image_capture_timing(self, timing: dict[str, Any]) -> tuple[float, float]:
+        """Return host capture stamp and the effective calibrated delay to the oldest image."""
+
+        camera_timestamps = timing.get("camera_timestamps", {})
+        finite_camera_timestamps: dict[str, float] = {}
+        if isinstance(camera_timestamps, dict):
+            finite_camera_timestamps = {
+                str(key): float(value)
+                for key, value in camera_timestamps.items()
+                if isinstance(value, Real) and math.isfinite(float(value))
+            }
+        if finite_camera_timestamps:
+            if self._camera_capture_delay_s:
+                missing = set(self._camera_capture_delay_s) - set(finite_camera_timestamps)
+                unexpected = set(finite_camera_timestamps) - set(self._camera_capture_delay_s)
+                if missing or unexpected:
+                    raise _RTCFatalError(
+                        "RTC camera timing layout differs from calibrated artifact: "
+                        f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+                    )
+                physical_timestamps = {
+                    key: timestamp - self._camera_capture_delay_s[key]
+                    for key, timestamp in finite_camera_timestamps.items()
+                }
+                capture_timestamp = min(finite_camera_timestamps.values())
+                physical_anchor = min(physical_timestamps.values())
+                effective_delay_s = capture_timestamp - physical_anchor
+                skew_values = list(physical_timestamps.values())
+            else:
+                capture_timestamp = min(finite_camera_timestamps.values())
+                effective_delay_s = self._image_capture_delay_s
+                skew_values = list(finite_camera_timestamps.values())
+            skew = max(skew_values) - min(skew_values)
+            if self._max_camera_skew_s > 0 and skew > self._max_camera_skew_s:
+                raise _RTCFatalError(
+                    "RTC camera timestamp skew exceeds configured limit: "
+                    f"skew_ms={skew * 1000.0:.3f}, limit_ms={self._max_camera_skew_s * 1000.0:.3f}"
+                )
+            # Align the shared proprioceptive input with the oldest image so no
+            # camera is conditioned on a state from its future.
+            return capture_timestamp, effective_delay_s
+        if self._camera_capture_delay_s:
+            raise _RTCFatalError("RTC calibrated sensor timing requires finite timestamps for every camera")
+        fallback = timing.get("observation_timestamp")
+        if isinstance(fallback, Real) and math.isfinite(float(fallback)):
+            return float(fallback), self._image_capture_delay_s
+        return self._monotonic_seconds(), self._image_capture_delay_s
+
+    def _tensor_actions_as_mappings(self, actions: torch.Tensor | None) -> list[dict[str, float]]:
+        if actions is None:
+            return []
+        rows = actions.detach().to(device="cpu", dtype=torch.float32)
+        if rows.ndim != 2:
+            raise ValueError(f"Expected action queue tensor [T,A], got {tuple(rows.shape)}")
+        if rows.shape[1] < len(self._action_keys):
+            raise ValueError(
+                "Action queue has fewer dimensions than robot action keys: "
+                f"shape={tuple(rows.shape)}, keys={len(self._action_keys)}"
+            )
+        return [{key: float(row[index]) for index, key in enumerate(self._action_keys)} for row in rows]
+
+    def _executor_preview_as_timed_records(
+        self,
+        *,
+        request_timestamp: float,
+        predicted_completion_timestamp: float,
+    ) -> list[TimedRecord]:
+        executor = self._realtime_executor
+        if executor is None:
+            raise RuntimeError("executor preview requested without a realtime executor")
+        with self._executor_state_lock:
+            if not executor.initialized:
+                raise _RTCFatalError(
+                    "RTC dynamic prefill cannot preview commands before the realtime executor is initialized"
+                )
+            preview = executor.preview_through(predicted_completion_timestamp)
+        tolerance = max(
+            _EXECUTOR_TIMESTAMP_TOLERANCE_S,
+            executor.config.heartbeat_dt_s * 1e-6,
+        )
+        return [
+            TimedRecord(
+                item.timestamp,
+                {key: float(item.command[index]) for index, key in enumerate(self._action_keys)},
+                "monotonic",
+            )
+            for item in preview
+            if item.timestamp + tolerance >= request_timestamp
+        ]
+
+    def _prefill_actions_to_policy_space(
+        self,
+        prefill: CommittedActionPrefill,
+        *,
+        policy_device: torch.device,
+    ) -> torch.Tensor:
+        absolute = torch.tensor(
+            [[float(action[key]) for key in self._action_keys] for action in prefill.actions],
+            dtype=torch.float32,
+        )
+        if self._relative_step is not None:
+            raw_state = self._relative_step.get_cached_state()
+            if raw_state is None:
+                raise RuntimeError("Dynamic RTC prefill requires a cached aligned observation state")
+            return reanchor_relative_rtc_prefix(
+                prev_actions_absolute=absolute,
+                current_state=raw_state,
+                relative_step=self._relative_step,
+                normalizer_step=self._normalizer_step,
+                policy_device=policy_device,
+            )
+        transition = create_transition(action=absolute)
+        if self._normalizer_step is not None:
+            transition = self._normalizer_step(transition)
+        return transition[TransitionKey.ACTION].to(policy_device)
+
+    def notify_control_observation(self, obs: dict) -> None:
+        """Publish the latest raw state for independent command dispatch."""
+
+        if self._realtime_executor is None:
+            return
+        timing = self._observation_timing()
+        state_timestamp = timing.get("state_timestamp")
+        if not isinstance(state_timestamp, Real) or not math.isfinite(float(state_timestamp)):
+            state_timestamp = self._monotonic_seconds()
+        physical_state_timestamp = float(state_timestamp) - self._state_observation_delay_s
+        state_values = self._numeric_values(obs)
+        control_state = None
+        if all(key in state_values for key in self._action_keys):
+            control_state = torch.tensor(
+                [state_values[key] for key in self._action_keys],
+                dtype=torch.float64,
+            )
+        with self._obs_lock:
+            self._obs_holder["control_observation"] = dict(obs)
+            self._obs_holder["control_state"] = control_state
+            self._obs_holder["control_state_timestamp"] = physical_state_timestamp
+
     def notify_observation(self, obs: dict) -> None:
         """Publish the latest observation for the RTC thread to consume."""
+        if self._realtime_executor is not None:
+            with self._obs_lock:
+                has_control_observation = self._obs_holder.get("control_observation") is not None
+            if not has_control_observation:
+                self.notify_control_observation(obs)
+        needs_timing = (
+            self._trajectory is not None
+            or self._dynamic_prefill_enabled
+            or self._trace is not None
+            or self._realtime_executor is not None
+        )
+        timing = self._observation_timing() if needs_timing else {}
+        physical_state_timestamp = None
+        if needs_timing:
+            state_timestamp = timing.get("state_timestamp")
+            if not isinstance(state_timestamp, Real) or not math.isfinite(float(state_timestamp)):
+                state_timestamp = self._monotonic_seconds()
+            physical_state_timestamp = float(state_timestamp) - self._state_observation_delay_s
+        state_values = self._numeric_values(obs)
+        executor_state = None
+        if self._realtime_executor is not None and all(key in state_values for key in self._action_keys):
+            executor_state = torch.tensor(
+                [state_values[key] for key in self._action_keys],
+                dtype=torch.float64,
+            )
+        if self._trajectory is not None:
+            if physical_state_timestamp is None:
+                raise RuntimeError("trajectory observation timing was not initialized")
+            self._trajectory.append_state(state_values, timestamp=physical_state_timestamp)
+            if self._trace is not None:
+                self._trace.write(
+                    "observation",
+                    observed_state=state_values,
+                    observation_timing=timing,
+                    physical_state_timestamp=physical_state_timestamp,
+                )
         with self._obs_lock:
             self._observation_sequence += 1
             self._obs_holder["obs"] = obs
             self._obs_holder["observation_epoch"] = self._observation_epoch
             self._obs_holder["observation_sequence"] = self._observation_sequence
+            self._obs_holder["observation_timing"] = timing
+            self._obs_holder["executor_state"] = executor_state
+            self._obs_holder["executor_state_timestamp"] = physical_state_timestamp
 
     def notify_action_result(self, requested: dict, sent: dict | None, observation: dict) -> None:
         """Track robot-space safety residuals and request an unguided replan when persistent."""
+        if self._trajectory is not None:
+            self._trajectory.append_action(
+                self._numeric_values(sent if sent is not None else requested),
+                timestamp=self._monotonic_seconds(),
+            )
+        if self._trace is not None:
+            self._trace.write(
+                "dispatch_result",
+                requested=requested,
+                sent=sent,
+                observed=observation,
+                aligned_future_actions=(
+                    None
+                    if self._trajectory is None
+                    else self._trajectory.future_action_trajectory(
+                        self._monotonic_seconds(),
+                        1.0 / max(float(self._fps), 1.0),
+                        self._rtc_config.execution_horizon,
+                    )
+                ),
+            )
         if not self._prefix_health_enabled:
             return
 
@@ -607,6 +1523,10 @@ class RTCInferenceEngine(InferenceEngine):
 
     def _enter_fatal_state(self, error: BaseException) -> None:
         """Fail closed, clear queued actions, and stop the owning rollout."""
+        if self._trace is not None:
+            mark_abnormal = getattr(self._trace, "mark_abnormal", None)
+            if callable(mark_abnormal):
+                mark_abnormal(error)
         with self._action_dispatch_lock, self._fatal_state_lock:
             if self._fatal_error is None:
                 self._fatal_error = error
@@ -664,6 +1584,7 @@ class RTCInferenceEngine(InferenceEngine):
                     obs = self._obs_holder.get("obs")
                     observation_epoch = self._obs_holder.get("observation_epoch")
                     observation_sequence = self._obs_holder.get("observation_sequence", 0)
+                    observation_timing = self._obs_holder.get("observation_timing")
                 if queue is None or obs is None:
                     time.sleep(_RTC_IDLE_SLEEP_S)
                     continue
@@ -681,6 +1602,10 @@ class RTCInferenceEngine(InferenceEngine):
                         inference_start = (
                             queue.snapshot() if self._rtc_timing_mode == "actual_consumed" else None
                         )
+                        executor_heartbeat_start: int | None = None
+                        if self._realtime_executor is not None:
+                            with self._executor_state_lock:
+                                executor_heartbeat_start = self._executor_applied_heartbeat_count
                         diagnostic_before = (
                             inference_start
                             if self._timing_diagnostics and inference_start is not None
@@ -688,7 +1613,8 @@ class RTCInferenceEngine(InferenceEngine):
                             if self._timing_diagnostics
                             else None
                         )
-                        current_time = time.perf_counter()
+                        current_time = self._monotonic_seconds()
+                        inference_started_monotonic = current_time
                         if inference_start is not None:
                             idx_before = inference_start.next_action_index
                             prev_actions = inference_start.original_leftover
@@ -718,6 +1644,15 @@ class RTCInferenceEngine(InferenceEngine):
                             latency = latency_tracker.max()
                             delay = math.ceil(latency / time_per_action) if latency else 0
 
+                        if (
+                            self._rtc_inference_mode == "trained_prefix"
+                            and delay > self._rtc_training_max_delay
+                        ):
+                            raise _RTCFatalError(
+                                "RTC delay exceeds checkpoint trained-prefix capacity: "
+                                f"delay={delay}, capacity={self._rtc_training_max_delay}"
+                            )
+
                         if suppress_prefix_guidance:
                             prev_actions = None
                             logger.info(
@@ -725,7 +1660,70 @@ class RTCInferenceEngine(InferenceEngine):
                                 feedback_revision,
                             )
 
-                        obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
+                        dynamic_prefill: CommittedActionPrefill | None = None
+                        dynamic_anchor_steps: int | None = None
+                        obs_for_inference = obs
+                        if self._dynamic_prefill_enabled:
+                            if self._trajectory is None:
+                                raise _RTCFatalError("RTC dynamic prefill requires a trajectory timeline")
+                            timing = observation_timing if isinstance(observation_timing, dict) else {}
+                            capture_timestamp, effective_image_delay_s = self._image_capture_timing(timing)
+                            aligned_timestamp = capture_timestamp - effective_image_delay_s
+                            aligned_state = self._trajectory.estimate_state(aligned_timestamp)
+                            if aligned_state is not None:
+                                obs_for_inference = dict(obs)
+                                for key, value in aligned_state.items():
+                                    if key in obs_for_inference and isinstance(obs_for_inference[key], Real):
+                                        obs_for_inference[key] = value
+
+                            executor_prefill_available = (
+                                self._realtime_executor is not None and self._realtime_executor.initialized
+                            )
+                            queued_prefill_available = (
+                                inference_start is not None
+                                and inference_start.processed_leftover is not None
+                                and len(inference_start.processed_leftover) > 0
+                            )
+                            if (
+                                not suppress_prefix_guidance
+                                and inference_start is not None
+                                and (executor_prefill_available or queued_prefill_available)
+                            ):
+                                predicted_completion = current_time + delay * time_per_action
+                                overflow = "raise" if self._prefill_overflow == "error" else "truncate"
+                                future_action_queue = (
+                                    self._executor_preview_as_timed_records(
+                                        request_timestamp=current_time,
+                                        predicted_completion_timestamp=predicted_completion,
+                                    )
+                                    if self._realtime_executor is not None
+                                    else self._tensor_actions_as_mappings(inference_start.processed_leftover)
+                                )
+                                try:
+                                    dynamic_prefill = self._trajectory.build_committed_prefill(
+                                        image_capture_timestamp=capture_timestamp,
+                                        calibrated_image_delay_s=effective_image_delay_s,
+                                        request_timestamp=current_time,
+                                        predicted_completion_timestamp=predicted_completion,
+                                        dt=time_per_action,
+                                        future_action_queue=future_action_queue,
+                                        max_prefill_steps=self._max_prefill_steps,
+                                        overflow=overflow,
+                                    )
+                                except PrefillCapacityError as exc:
+                                    raise _RTCFatalError(str(exc)) from exc
+                                if dynamic_prefill.truncated:
+                                    raise _RTCFatalError(
+                                        "RTC dynamic prefill truncation is diagnostic-only and cannot be dispatched"
+                                    )
+                                if len(dynamic_prefill) == 0:
+                                    dynamic_prefill = None
+                                else:
+                                    dynamic_anchor_steps = delay - 1
+
+                        obs_batch = build_dataset_frame(
+                            self._hw_features, obs_for_inference, prefix="observation"
+                        )
                         obs_batch = prepare_observation_for_inference(
                             obs_batch, policy_device, self._task, self._robot.robot_type
                         )
@@ -747,7 +1745,12 @@ class RTCInferenceEngine(InferenceEngine):
 
                             preprocessed = self._preprocessor(obs_batch)
 
-                            if prev_actions is not None and self._relative_step is not None:
+                            if dynamic_prefill is not None:
+                                prev_actions = self._prefill_actions_to_policy_space(
+                                    dynamic_prefill,
+                                    policy_device=policy_device,
+                                )
+                            elif prev_actions is not None and self._relative_step is not None:
                                 # Rebase against the raw cached state so the leftover tail stays in
                                 # the training-time coordinate frame.
                                 raw_state = self._relative_step.get_cached_state()
@@ -771,19 +1774,117 @@ class RTCInferenceEngine(InferenceEngine):
                                     prev_actions, target_steps=self._rtc_config.execution_horizon
                                 )
 
-                            actions = self._policy.predict_action_chunk(
-                                preprocessed,
-                                inference_delay=delay,
-                                prev_chunk_left_over=prev_actions,
-                            )
+                            model_prefill_len = len(dynamic_prefill) if dynamic_prefill is not None else delay
+                            action_kwargs = {
+                                "inference_delay": model_prefill_len,
+                                "prev_chunk_left_over": prev_actions,
+                            }
+                            if self._rtc_inference_mode == "trained_prefix":
+                                action_kwargs["rtc_mode"] = self._rtc_inference_mode
+                            actions = self._policy.predict_action_chunk(preprocessed, **action_kwargs)
 
                             if self._shutdown_event.is_set():
                                 logger.info("RTC discarded inference result requested during shutdown")
                                 return
 
-                            original = actions.squeeze(0).clone()
-                            processed = self._postprocessor(actions).squeeze(0)
-                        new_latency = time.perf_counter() - current_time
+                            raw_model_chunk = actions.squeeze(0).clone()
+                            raw_original = (
+                                raw_model_chunk[model_prefill_len:].clone()
+                                if dynamic_prefill is not None
+                                else raw_model_chunk
+                            )
+                            if raw_original.numel() == 0:
+                                raise _RTCFatalError(
+                                    "RTC dynamic prefill consumed the entire model action chunk"
+                                )
+                            original = raw_original
+                            raw_processed = self._postprocessor(raw_original.unsqueeze(0)).squeeze(0)
+                            processed = raw_processed
+                            plan_result = None
+                            if self._time_axis_planner is not None:
+                                committed_prefix_steps = (
+                                    0
+                                    if dynamic_prefill is not None
+                                    else model_prefill_len
+                                    if self._rtc_inference_mode == "trained_prefix"
+                                    and prev_actions is not None
+                                    else 0
+                                )
+                                planner_coordinate_space = getattr(
+                                    self._time_axis_planner,
+                                    "feature_coordinate_space",
+                                    None,
+                                )
+                                # First and recovery inferences may have no prefix; the
+                                # planner contract, not prefix presence, selects coordinates.
+                                plan_in_robot_space = dynamic_prefill is not None
+                                if planner_coordinate_space is not None:
+                                    plan_in_robot_space = (
+                                        planner_coordinate_space == ROBOT_ACTION_COORDINATE_SPACE
+                                    )
+                                if plan_in_robot_space:
+                                    plan_result = self._time_axis_planner.plan(
+                                        raw_processed,
+                                        committed_prefix_steps=committed_prefix_steps,
+                                    )
+                                    processed = torch.as_tensor(
+                                        plan_result.actions,
+                                        dtype=raw_processed.dtype,
+                                        device=raw_processed.device,
+                                    )
+                                else:
+                                    # Legacy/guided RTC keeps the historical
+                                    # policy-space planning contract so its
+                                    # original and processed queues stay paired.
+                                    plan_result = self._time_axis_planner.plan(
+                                        raw_original,
+                                        committed_prefix_steps=committed_prefix_steps,
+                                    )
+                                    original = torch.as_tensor(
+                                        plan_result.actions,
+                                        dtype=raw_original.dtype,
+                                        device=raw_original.device,
+                                    )
+                                    processed = self._postprocessor(original.unsqueeze(0)).squeeze(0)
+                            if self._trace is not None:
+                                self._trace.write(
+                                    "inference_chunk",
+                                    inference_started_at=inference_started_monotonic,
+                                    inference_finished_at=self._monotonic_seconds(),
+                                    raw_model_chunk=raw_model_chunk,
+                                    trained_prefix=prev_actions,
+                                    raw_robot_chunk=raw_processed,
+                                    planned_chunk=processed,
+                                    planner_segment_durations=(
+                                        None if plan_result is None else plan_result.segment_durations
+                                    ),
+                                    planner_reference_segment_durations=(
+                                        None
+                                        if plan_result is None
+                                        else plan_result.reference_segment_durations
+                                    ),
+                                    planner_speed_factors=(
+                                        None if plan_result is None else plan_result.speed_factors
+                                    ),
+                                    planner_feature_coordinate_space=(
+                                        None
+                                        if self._time_axis_planner is None
+                                        else getattr(
+                                            self._time_axis_planner,
+                                            "feature_coordinate_space",
+                                            None,
+                                        )
+                                    ),
+                                    planner_fallback=(
+                                        None if plan_result is None else plan_result.used_fallback
+                                    ),
+                                    planner_reason=(None if plan_result is None else plan_result.reason),
+                                    inference_delay=delay,
+                                    model_prefill_len=model_prefill_len,
+                                    dynamic_prefill=dynamic_prefill,
+                                    dynamic_anchor_steps=dynamic_anchor_steps,
+                                )
+                        new_latency = self._monotonic_seconds() - current_time
                         new_delay = math.ceil(new_latency / time_per_action)
                         diagnostic_after_inference = queue.snapshot() if self._timing_diagnostics else None
 
@@ -804,6 +1905,7 @@ class RTCInferenceEngine(InferenceEngine):
                             latency_tracker.add(new_latency)
 
                         merge_result = None
+                        anchor_merge_result = None
                         if self._shutdown_event.is_set():
                             logger.info("RTC discarded completed inference result during shutdown")
                             return
@@ -819,32 +1921,79 @@ class RTCInferenceEngine(InferenceEngine):
                             consecutive_errors = 0
                             continue
                         if inference_start is not None:
-                            merge_result = queue.merge_actual_consumed(
-                                original,
-                                processed,
-                                inference_start,
-                                max_actual_consumed_steps=self._rtc_config.execution_horizon,
-                            )
-                            if merge_result.stale:
+                            if dynamic_prefill is not None:
+                                if dynamic_anchor_steps is None:
+                                    raise _RTCFatalError("RTC dynamic prefill has no queue anchor")
+                                if self._realtime_executor is not None:
+                                    if executor_heartbeat_start is None:
+                                        raise _RTCFatalError(
+                                            "RTC executor heartbeat baseline is missing for dynamic merge"
+                                        )
+                                    with self._executor_state_lock:
+                                        executor_heartbeats_now = self._executor_applied_heartbeat_count
+                                        external_consumed = max(
+                                            0,
+                                            executor_heartbeats_now - executor_heartbeat_start,
+                                        )
+                                        committed_steps = dynamic_anchor_steps + 1
+                                        anchor_merge_result = queue.merge_postfix_after_external_anchor(
+                                            original,
+                                            processed,
+                                            inference_start,
+                                            external_consumed_steps=external_consumed,
+                                            committed_steps=committed_steps,
+                                            max_actual_consumed_steps=self._rtc_config.execution_horizon,
+                                        )
+                                        if anchor_merge_result.merged:
+                                            self._executor_postfix_not_before_heartbeat = (
+                                                executor_heartbeat_start + committed_steps
+                                            )
+                                else:
+                                    anchor_merge_result = queue.merge_postfix_at_anchor(
+                                        original,
+                                        processed,
+                                        inference_start,
+                                        anchor_steps_after_start=dynamic_anchor_steps,
+                                        max_actual_consumed_steps=self._rtc_config.execution_horizon,
+                                    )
+                                active_merge_result = anchor_merge_result
+                            else:
+                                merge_result = queue.merge_actual_consumed(
+                                    original,
+                                    processed,
+                                    inference_start,
+                                    max_actual_consumed_steps=self._rtc_config.execution_horizon,
+                                )
+                                active_merge_result = merge_result
+                            if active_merge_result.stale:
                                 logger.info(
                                     "RTC discarded stale inference result: generation=%d->%d",
-                                    merge_result.expected_generation,
-                                    merge_result.observed_generation,
+                                    active_merge_result.expected_generation,
+                                    active_merge_result.observed_generation,
                                 )
                                 consecutive_errors = 0
                                 continue
 
-                            if merge_result.consumption_limit_exceeded:
+                            if active_merge_result.consumption_limit_exceeded:
                                 raise _RTCFatalError(
                                     "RTC consumed actions reached execution_horizon during one inference: "
-                                    f"actual_consumed_steps={merge_result.actual_consumed_steps}, "
+                                    f"actual_consumed_steps={active_merge_result.actual_consumed_steps}, "
                                     f"execution_horizon={self._rtc_config.execution_horizon}"
                                 )
+                            if (
+                                anchor_merge_result is not None
+                                and anchor_merge_result.insufficient_committed_actions
+                            ):
+                                raise _RTCFatalError(
+                                    "RTC dynamic anchor could not be merged: committed queue/postfix is no longer available"
+                                )
+                            if not active_merge_result.merged:
+                                raise _RTCFatalError("RTC inference result was not merged")
 
                             if suppress_prefix_guidance:
                                 self._acknowledge_prefix_health_revision(feedback_revision)
 
-                            if merge_result.skip_was_clamped:
+                            if merge_result is not None and merge_result.skip_was_clamped:
                                 consecutive_merge_skip_clamps += 1
                                 if consecutive_merge_skip_clamps >= 3:
                                     raise _RTCFatalError(
@@ -861,7 +2010,29 @@ class RTCInferenceEngine(InferenceEngine):
 
                         if diagnostic_before is not None and diagnostic_after_inference is not None:
                             diagnostic_after_merge = queue.snapshot()
-                            if merge_result is not None:
+                            if anchor_merge_result is not None:
+                                actual_consumed = anchor_merge_result.actual_consumed_steps
+                                merge_skip = anchor_merge_result.postfix_skip
+                                merge_skip_clamped = 0
+                                generation_before = anchor_merge_result.expected_generation
+                                generation_after_inference = anchor_merge_result.observed_generation
+                                generation_after_merge = anchor_merge_result.generation_after
+                                index_before = inference_start.next_action_index
+                                index_after_inference = index_before + actual_consumed
+                                index_after_merge = diagnostic_after_merge.next_action_index
+                                queue_before = inference_start.queue_size
+                                queue_after_inference = max(0, queue_before - actual_consumed)
+                                queue_after_merge = anchor_merge_result.queue_size_after
+                                current_total_consumed = inference_start.total_consumed + actual_consumed
+                                if previous_replan_total_consumed is None:
+                                    replan_interval_steps = 0
+                                else:
+                                    replan_interval_steps = max(
+                                        0,
+                                        current_total_consumed - previous_replan_total_consumed,
+                                    )
+                                previous_replan_total_consumed = current_total_consumed
+                            elif merge_result is not None:
                                 actual_consumed = merge_result.actual_consumed_steps
                                 merge_skip = merge_result.merge_skip
                                 merge_skip_clamped = int(merge_result.skip_was_clamped)
@@ -941,12 +2112,40 @@ class RTCInferenceEngine(InferenceEngine):
                                 merge_skip_clamped,
                                 warmup_state,
                             )
+                            if self._trace is not None:
+                                self._trace.write(
+                                    "queue_merge",
+                                    actual_consumed_steps=actual_consumed,
+                                    merge_skip=merge_skip,
+                                    generation_before=generation_before,
+                                    generation_after_inference=generation_after_inference,
+                                    generation_after_merge=generation_after_merge,
+                                    index_before=index_before,
+                                    index_after_inference=index_after_inference,
+                                    index_after_merge=index_after_merge,
+                                    queue_before=queue_before,
+                                    queue_after_inference=queue_after_inference,
+                                    queue_after_merge=queue_after_merge,
+                                    latency_ms=new_latency * 1000.0,
+                                    anchor_preserved_steps=(
+                                        None
+                                        if anchor_merge_result is None
+                                        else anchor_merge_result.preserved_steps
+                                    ),
+                                    anchor_postfix_skip=(
+                                        None
+                                        if anchor_merge_result is None
+                                        else anchor_merge_result.postfix_skip
+                                    ),
+                                )
 
                         consecutive_errors = 0
                         logger.debug("RTC inference latency=%.2fs, queue=%d", new_latency, queue.qsize())
 
                     except _RTCFatalError:
                         raise
+                    except RealtimeTraceWriteError as exc:
+                        raise _RTCFatalError("RTC deployment trace write failed") from exc
                     except Exception as e:
                         consecutive_errors += 1
                         logger.error(

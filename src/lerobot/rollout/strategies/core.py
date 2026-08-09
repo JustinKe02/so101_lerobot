@@ -87,6 +87,7 @@ class RolloutStrategy(abc.ABC):
         called (warmup completion, DAgger phase transitions back to AUTONOMOUS),
         because reset makes ``needs_new_action()`` return True on the next call.
         """
+        self._engine.notify_control_observation(obs_raw)
         if self._cached_obs_processed is None or self._interpolator.needs_new_action():
             obs_processed = processors.robot_observation_processor(obs_raw)
             self._engine.notify_observation(obs_processed)
@@ -302,6 +303,16 @@ def send_next_action(
     features = ctx.data.dataset_features
     ordered_keys = ctx.data.ordered_action_keys
 
+    if engine.owns_action_dispatch is True:
+        action_tensor = engine.get_action(None)
+        if action_tensor is None:
+            return None
+        if len(action_tensor) != len(ordered_keys):
+            raise ValueError(
+                f"Executor action tensor length ({len(action_tensor)}) != action keys ({len(ordered_keys)})"
+            )
+        return {key: action_tensor[index].item() for index, key in enumerate(ordered_keys)}
+
     if interpolator.needs_new_action():
         obs_frame = build_dataset_frame(features, obs_processed, prefix=OBS_STR)
         action_tensor = engine.get_action(obs_frame)
@@ -317,6 +328,7 @@ def send_next_action(
         raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
     processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
+    pre_filter = dict(processed)
     if ctx.policy.action_filter is not None:
         processed = ctx.policy.action_filter.apply(processed, obs_raw)
     with engine.action_dispatch_guard() as dispatch_allowed:
@@ -324,6 +336,16 @@ def send_next_action(
             return None
         sent = ctx.hardware.robot_wrapper.send_action(processed)
         engine.notify_action_result(processed, sent, obs_raw)
+        trace = getattr(ctx.policy, "trace", None)
+        if trace is not None:
+            trace.write(
+                "dispatch",
+                raw_model_action=action_dict,
+                pre_filter_target=pre_filter,
+                filtered_target=processed,
+                applied_command=sent,
+                observed_state=obs_raw,
+            )
     stall_guard = getattr(ctx.policy, "stall_guard", None)
     if stall_guard is not None:
         try:

@@ -74,6 +74,9 @@ class InferenceEngine(abc.ABC):
     def notify_observation(self, obs: dict) -> None:  # noqa: B027
         """Publish the latest processed observation.  Default: no-op."""
 
+    def notify_control_observation(self, obs: dict) -> None:  # noqa: B027
+        """Publish the latest raw control observation.  Default: no-op."""
+
     def notify_action_result(  # noqa: B027
         self,
         requested: dict,
@@ -112,4 +115,9 @@ class InferenceEngine(abc.ABC):
     @property
     def failed(self) -> bool:
         """True if an unrecoverable error occurred in the backend."""
+        return False
+
+    @property
+    def owns_action_dispatch(self) -> bool:
+        """Whether this engine sends commands from its own control thread."""
         return False

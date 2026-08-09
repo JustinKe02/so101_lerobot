@@ -64,6 +64,7 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+    rtc_mode: str
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -157,6 +158,37 @@ def pad_vector(vector, new_dim):
     if vector.shape[-1] >= new_dim:
         return vector
     return F.pad(vector, (0, new_dim - vector.shape[-1]))
+
+
+def prepare_rtc_training_inputs(
+    actions: Tensor,
+    noise: Tensor,
+    time: Tensor,
+    prefix_lengths: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
+    """Build clean-prefix flow inputs, token times, and postfix loss weights."""
+    token_times = time[:, None].expand(actions.shape[0], actions.shape[1])
+    time_expanded = token_times[:, :, None]
+    x_t = time_expanded * noise + (1 - time_expanded) * actions
+    u_t = noise - actions
+    if prefix_lengths is None:
+        return x_t, u_t, None, token_times
+    if prefix_lengths.ndim != 1 or prefix_lengths.shape[0] != actions.shape[0]:
+        raise ValueError("prefix_lengths must have shape (batch_size,)")
+    prefix_lengths = prefix_lengths.to(device=actions.device, dtype=torch.long)
+    if (prefix_lengths < 0).any() or (prefix_lengths >= actions.shape[1]).any():
+        raise ValueError("prefix_lengths must be in [0, action_horizon)")
+
+    positions = torch.arange(actions.shape[1], device=actions.device)[None, :]
+    prefix_mask = positions < prefix_lengths[:, None]
+    token_times = torch.where(prefix_mask, torch.zeros_like(token_times), token_times)
+    x_t = token_times[:, :, None] * noise + (1 - token_times[:, :, None]) * actions
+    x_t = torch.where(prefix_mask[:, :, None], actions, x_t)
+
+    postfix_weights = (~prefix_mask).to(dtype=x_t.dtype)
+    valid_steps = postfix_weights.sum(dim=1).clamp_min(1.0)
+    postfix_weights = postfix_weights * (actions.shape[1] / valid_steps)[:, None]
+    return x_t, u_t, postfix_weights[:, :, None], token_times
 
 
 def resize_with_pad_torch(  # see openpi `resize_with_pad_torch` (exact copy)
@@ -730,14 +762,30 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = []
 
         # Embed timestep using sine-cosine positional encoding
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.action_in_proj.out_features,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
-            device=timestep.device,
-        )
+        if timestep.ndim == 1:
+            time_emb = create_sinusoidal_pos_embedding(
+                timestep,
+                self.action_in_proj.out_features,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=timestep.device,
+            )
+            token_time_emb = None
+        elif timestep.ndim == 2 and timestep.shape[:2] == noisy_actions.shape[:2]:
+            flat_timestep = timestep.reshape(-1)
+            token_time_emb = create_sinusoidal_pos_embedding(
+                flat_timestep,
+                self.action_in_proj.out_features,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=timestep.device,
+            ).reshape(noisy_actions.shape[0], noisy_actions.shape[1], -1)
+            time_emb = token_time_emb
+        else:
+            raise ValueError("timestep must have shape (batch_size,) or (batch_size, action_horizon)")
         time_emb = time_emb.type(dtype=timestep.dtype)
+        if token_time_emb is not None:
+            token_time_emb = token_time_emb.type(dtype=timestep.dtype)
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
@@ -770,14 +818,27 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise, time) -> Tensor:
+    def forward(
+        self,
+        images,
+        img_masks,
+        tokens,
+        masks,
+        actions,
+        noise,
+        time,
+        rtc_prefix_lengths: Tensor | None = None,
+    ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t, u_t, loss_weights, token_times = prepare_rtc_training_inputs(
+            actions, noise, time, rtc_prefix_lengths
+        )
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+        # Preserve the original scalar AdaRMS path when RTC training is off;
+        # action-prefix training opts into true per-token conditioning.
+        suffix_timestep = token_times if rtc_prefix_lengths is not None else time
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, suffix_timestep)
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -817,7 +878,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        losses = F.mse_loss(u_t, v_t, reduction="none")
+        if loss_weights is not None:
+            losses = losses * loss_weights
+        return losses
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -851,9 +915,37 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         dt = -1.0 / num_steps
 
         x_t = noise
+        trained_prefix = None
+        trained_prefix_len = 0
+        if self._rtc_enabled() and kwargs.get("rtc_mode", "guided") == "trained_prefix":
+            prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+            inference_delay = kwargs.get("inference_delay") or 0
+            trained_prefix_len = min(
+                int(inference_delay),
+                self.config.rtc_training_max_delay,
+                self.config.chunk_size,
+            )
+            if prev_chunk_left_over is not None and trained_prefix_len > 0:
+                if prev_chunk_left_over.ndim == 2:
+                    prev_chunk_left_over = prev_chunk_left_over.unsqueeze(0)
+                if prev_chunk_left_over.ndim != 3:
+                    raise ValueError("prev_chunk_left_over must have shape (T, A) or (B, T, A)")
+                trained_prefix = pad_vector(
+                    prev_chunk_left_over[:, :trained_prefix_len], self.config.max_action_dim
+                ).to(device=device, dtype=x_t.dtype)
+                trained_prefix_len = min(trained_prefix_len, trained_prefix.shape[1])
+            else:
+                trained_prefix_len = 0
+
         for step in range(num_steps):
+            if trained_prefix is not None and trained_prefix_len > 0:
+                x_t = x_t.clone()
+                x_t[:, :trained_prefix_len] = trained_prefix[:, :trained_prefix_len]
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            if trained_prefix_len > 0:
+                time_tensor = time_tensor[:, None].expand(bsize, self.config.chunk_size).clone()
+                time_tensor[:, :trained_prefix_len] = 0.0
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
@@ -863,7 +955,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     timestep=current_timestep,
                 )
 
-            if self._rtc_enabled():
+            if self._rtc_enabled() and kwargs.get("rtc_mode", "guided") == "trained_prefix":
+                v_t = denoise_step_partial_call(x_t)
+            elif self._rtc_enabled():
                 inference_delay = kwargs.get("inference_delay")
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
@@ -880,6 +974,10 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
+
+            if trained_prefix is not None and trained_prefix_len > 0:
+                x_t = x_t.clone()
+                x_t[:, :trained_prefix_len] = trained_prefix[:, :trained_prefix_len]
 
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
@@ -1289,7 +1387,26 @@ class PI05Policy(PreTrainedPolicy):
         time = self.model.sample_time(actions.shape[0], actions.device)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions, noise, time)
+        rtc_prefix_lengths = None
+        max_delay = self.config.rtc_training_max_delay
+        if self.training and max_delay > 0:
+            rtc_prefix_lengths = torch.randint(
+                low=0,
+                high=max_delay + 1,
+                size=(actions.shape[0],),
+                device=actions.device,
+            )
+
+        losses = self.model.forward(
+            images,
+            img_masks,
+            tokens,
+            masks,
+            actions,
+            noise,
+            time,
+            rtc_prefix_lengths=rtc_prefix_lengths,
+        )
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]

@@ -36,6 +36,7 @@ from lerobot.rollout.configs import (
 from lerobot.rollout.inference.factory import (
     RTCGuidanceDelayMode,
     RTCInferenceConfig,
+    RTCInferenceMode,
     RTCTimingMode,
     create_inference_engine,
 )
@@ -57,6 +58,7 @@ def test_rtc_phase1_defaults_preserve_legacy_behavior() -> None:
     cfg = RTCInferenceConfig()
 
     assert cfg.timing_mode is RTCTimingMode.LEGACY
+    assert cfg.mode is RTCInferenceMode.GUIDED
     assert cfg.guidance_delay_mode is RTCGuidanceDelayMode.LEGACY_MAX
     assert cfg.fixed_guidance_delay_steps == 5
     assert cfg.latency_warmup_inferences == 5
@@ -122,6 +124,37 @@ def test_actual_consumed_guidance_modes_decode(guidance_mode: str) -> None:
 
     assert cfg.timing_mode is RTCTimingMode.ACTUAL_CONSUMED
     assert cfg.guidance_delay_mode.value == guidance_mode
+
+
+def test_trained_prefix_mode_decodes_explicitly() -> None:
+    cfg = draccus.decode(
+        RTCInferenceConfig,
+        {
+            "mode": "trained_prefix",
+            "timing_mode": "actual_consumed",
+            "guidance_delay_mode": "fixed",
+        },
+    )
+
+    assert cfg.mode is RTCInferenceMode.TRAINED_PREFIX
+
+
+def test_trained_prefix_engine_rejects_checkpoint_without_training_capacity() -> None:
+    policy = SimpleNamespace(config=SimpleNamespace(chunk_size=50, rtc_training_max_delay=0))
+
+    with pytest.raises(ValueError, match="rtc_training_max_delay"):
+        RTCInferenceEngine(
+            policy=policy,
+            preprocessor=None,
+            postprocessor=None,
+            robot_wrapper=None,
+            rtc_config=SimpleNamespace(execution_horizon=10),
+            hw_features={},
+            task="",
+            fps=30.0,
+            device="cpu",
+            rtc_inference_mode="trained_prefix",
+        )
 
 
 @pytest.mark.parametrize(
