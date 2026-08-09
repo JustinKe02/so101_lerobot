@@ -1,0 +1,114 @@
+{
+  "robot": {
+    "type": "so101_follower",
+    "port": "/dev/serial/by-id/usb-1a86_USB_Single_Serial_5A7C123192-if00",
+    "id": "tk_follower",
+    "calibration_dir": "/data/cqy_workspace/tk/hf_cache/huggingface/lerobot/calibration/robots/so_follower",
+    "max_relative_target": null,
+    "cameras": {
+      "top": {"type": "opencv", "index_or_path": "/dev/video4", "width": 640, "height": 480, "fps": 30, "backend": 200},
+      "wrist": {"type": "opencv", "index_or_path": "/dev/video6", "width": 640, "height": 480, "fps": 30, "backend": 200}
+    }
+  },
+  "policy": {
+    "path": "/data/cqy_workspace/tk/lerobot_src/outputs/train/pi05_so101_realtime_vla_v2_full_10epochs_rtc6_seed1000/checkpoints/005613/pretrained_model",
+    "gradient_checkpointing": false,
+    "num_inference_steps": 10
+  },
+  "strategy": {"type": "base"},
+  "inference": {
+    "type": "rtc",
+    "mode": "trained_prefix",
+    "queue_threshold": 20,
+    "timing_mode": "actual_consumed",
+    "guidance_delay_mode": "rolling_p95",
+    "fixed_guidance_delay_steps": 2,
+    "latency_warmup_inferences": 5,
+    "latency_window_size": 32,
+    "latency_percentile": 0.95,
+    "timing_diagnostics": true,
+    "prefix_health_enabled": true,
+    "prefix_health_severe_residual_threshold": 5.0,
+    "prefix_health_consecutive_severe": 3,
+    "prefix_health_safety_stop_replans": 2,
+    "dynamic_prefill_enabled": false,
+    "image_capture_delay_s": 0.055,
+    "state_observation_delay_s": 0.050,
+    "max_prefill_steps": 6,
+    "max_camera_skew_s": 0.050,
+    "prefill_overflow": "error",
+    "rtc": {
+      "enabled": true,
+      "execution_horizon": 20,
+      "max_guidance_weight": 10.0,
+      "prefix_attention_schedule": "EXP"
+    }
+  },
+  "time_axis_planner": {
+    "enabled": true,
+    "dt_ref": 0.03333333333333333,
+    "dt_min": 0.020,
+    "dt_max": 0.100,
+    "lambda_acc": 1.0,
+    "lambda_time": 0.1,
+    "lambda_velocity": 10.0,
+    "max_velocity": [66.0, 95.0, 95.0, 53.0, 40.0, 102.0],
+    "max_acceleration": [317.0, 317.0, 396.0, 475.0, 396.0, 924.0],
+    "horizon": 20,
+    "stride": 10,
+    "optimization_dims": [0, 1, 2, 3, 4, 5]
+  },
+  "speed_adapter": {
+    "enabled": false,
+    "device": "cpu",
+    "verify_checksum": true,
+    "require_trained_checkpoint": true,
+    "feature_coordinate_space": "robot_action_units"
+  },
+  "realtime_executor": {
+    "enabled": false,
+    "actuator_calibration": {"enabled": false},
+    "actuator_tau_s": 0.150,
+    "enable_forward_tracking": true,
+    "forward_lead_s": null,
+    "forward_feedback_gain": 0.0,
+    "savgol_window_length": 5,
+    "savgol_polyorder": 2
+  },
+  "trace": {
+    "enabled": true,
+    "path": "outputs/traces/pi05_rtc6_triton_direct_rolling_p95.jsonl",
+    "max_history": 1024
+  },
+  "fps": 30,
+  "duration": 0,
+  "preflight_only": false,
+  "interpolation_multiplier": 1,
+  "device": "cuda",
+  "task": "Put the block in the bin",
+  "seed": 1000,
+  "display_data": false,
+  "play_sounds": false,
+  "return_to_initial_position": false,
+  "action_filter": {"enabled": false},
+  "stall_guard_ticks": 0,
+  "stall_guard_tolerance": 0.001,
+  "pi05_prefix_backend": "pytorch",
+  "pi05_action_backend": "triton",
+  "pi05_triton_export_weights": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/pi05_rtc6_triton.pkl",
+  "pi05_triton_weights_sha256": "8bb1dcd1e44e035c8a473863a0633cbc8cc63d4946d9a5d41e226080bf7dc088",
+  "pi05_triton_model_config": "/data/cqy_workspace/tk/lerobot_src/outputs/train/pi05_so101_realtime_vla_v2_full_10epochs_rtc6_seed1000/checkpoints/005613/pretrained_model/config.json",
+  "pi05_triton_tokenizer_path": "/data/cqy_workspace/tk/model_assets/google/paligemma-3b-pt-224",
+  "pi05_triton_camera_keys": [
+    "observation.images.top",
+    "observation.images.wrist"
+  ],
+  "pi05_triton_prompt_capacity": 64,
+  "pi05_triton_tokenizer_max_length": 200,
+  "pi05_triton_min_free_cuda_gib": 18.0,
+  "pi05_triton_parity_report": {
+    "enabled": true,
+    "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/aggregate_report.json",
+    "sha256": "38b6015fb87ba658148101488bfa6314d5130e6776cbfa1162f08ab4181c5041"
+  }
+}

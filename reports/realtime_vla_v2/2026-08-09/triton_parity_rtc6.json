@@ -1,0 +1,201 @@
+{
+  "passed": true,
+  "prefix_results": [
+    {
+      "max_abs_error": 0.04808299243450165,
+      "mean_abs_error": 0.010827676393091679,
+      "passed": true,
+      "prefix_length": 0,
+      "pytorch_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/pytorch_prefix0.npz",
+        "sha256": "5d34ae4b597b2077f6d8e95864135e17dd4b137e13b5370d1faa4edcab2ac335"
+      },
+      "request": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/request_prefix0.npz",
+        "sha256": "e823bcebada8d1bb1ceec17475c5b2b1326a34cb520b9ba36bd8062a80a89546"
+      },
+      "request_fingerprint": "c65d94765500a9ddaee151f99b27fe247d752828b05401437230db2b8be9137c",
+      "seed": 0,
+      "shape": [
+        50,
+        6
+      ],
+      "triton_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/triton_final_prefix0.npz",
+        "sha256": "9fae1d57ea09a8a2a78619f8832948914570ba71ac2895637f38a87bb905dcab"
+      }
+    },
+    {
+      "max_abs_error": 0.04940328747034073,
+      "mean_abs_error": 0.01191157940775156,
+      "passed": true,
+      "prefix_length": 1,
+      "pytorch_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/pytorch_prefix1.npz",
+        "sha256": "5bd7811a723a51a08b59e4755cf756a582703ff475aedbd4ce279db1a25ee65f"
+      },
+      "request": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/request_prefix1.npz",
+        "sha256": "aea55178643d3217452a1f21c78124cb5452c45e90edc5445fee8e2829155652"
+      },
+      "request_fingerprint": "d9cd8448c4acec18de51bab3ca66d70eeec93f3912935edecb086440af0486c1",
+      "seed": 0,
+      "shape": [
+        50,
+        6
+      ],
+      "triton_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/triton_final_prefix1.npz",
+        "sha256": "8ec4bd76a336b8c0b7bdd8586d0f22e6ad478e19ddd3a34b83738996a7796ad5"
+      }
+    },
+    {
+      "max_abs_error": 0.031995147466659546,
+      "mean_abs_error": 0.00866998452693224,
+      "passed": true,
+      "prefix_length": 2,
+      "pytorch_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/pytorch_prefix2.npz",
+        "sha256": "c4e3d94426a73c49a2460bf1afb535c1713afe6f4f02d12e9db0c8fb0c6fc773"
+      },
+      "request": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/request_prefix2.npz",
+        "sha256": "f60f2b5621f2e3241eb0fcce40e221eb214c4184ed3208c8e676bbdc5beb2b29"
+      },
+      "request_fingerprint": "faeeacb2e4f5ab418bbbfbe794d792d3fbf32aedc6580153f4039f8932c9c075",
+      "seed": 0,
+      "shape": [
+        50,
+        6
+      ],
+      "triton_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/triton_final_prefix2.npz",
+        "sha256": "abb97d373b8bf1e71c6d864317be80d565a32159f0bdcdb2de7ac2231602806e"
+      }
+    },
+    {
+      "max_abs_error": 0.04300420731306076,
+      "mean_abs_error": 0.009514221921563148,
+      "passed": true,
+      "prefix_length": 3,
+      "pytorch_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/pytorch_prefix3.npz",
+        "sha256": "9114f73c4381e3489fb16d8d61d7fa7eed72cf7c252b5127cac5a905c93c63bf"
+      },
+      "request": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/request_prefix3.npz",
+        "sha256": "e4e34042b6e15e4747768f05971aa78ea6dfe2266c32663467e0df90250fabc0"
+      },
+      "request_fingerprint": "85c1e642467862e81ad9319de2188b9be39834e7257431da8a61eab87ada1c85",
+      "seed": 0,
+      "shape": [
+        50,
+        6
+      ],
+      "triton_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/triton_final_prefix3.npz",
+        "sha256": "afa14a74408b54fc9438693abcce03e6f2b612e9a0db0f0c5e72792999e31309"
+      }
+    },
+    {
+      "max_abs_error": 0.027044624090194702,
+      "mean_abs_error": 0.00673545990139246,
+      "passed": true,
+      "prefix_length": 4,
+      "pytorch_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/pytorch_prefix4.npz",
+        "sha256": "dd1ed35fc6b0e399f8af4e31bd22d2ea432f8a9cd2a6bfa1ab8ee20b09ccdc8a"
+      },
+      "request": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/request_prefix4.npz",
+        "sha256": "0fc1c70eb1609d3b2ff63f4a89302a3f18111792fecfe2123f3f14682e737adc"
+      },
+      "request_fingerprint": "7b760c32d68ebcc4ea18674b15d9c4d7cde67ebd603bbfb0a145d00420d49c0b",
+      "seed": 0,
+      "shape": [
+        50,
+        6
+      ],
+      "triton_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/triton_final_prefix4.npz",
+        "sha256": "b0b1c709f39c1c93112e8d680fac9be155a5155ffbf225b380f2c2d7c810dc1b"
+      }
+    },
+    {
+      "max_abs_error": 0.022363215684890747,
+      "mean_abs_error": 0.005864972248673439,
+      "passed": true,
+      "prefix_length": 5,
+      "pytorch_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/pytorch_prefix5.npz",
+        "sha256": "2e0b5d44847d78d761e2a95a2412a9cfc6033398bfcb072c93a12887d5cca553"
+      },
+      "request": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/request_prefix5.npz",
+        "sha256": "f4b1e444f53525793039bcf0c5b682072e922fda62b2393eec9ab13c71a4b44e"
+      },
+      "request_fingerprint": "2e03958cc1889281d0e7c0275add52005778c99f8339cefdc47631e88640c552",
+      "seed": 0,
+      "shape": [
+        50,
+        6
+      ],
+      "triton_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/triton_final_prefix5.npz",
+        "sha256": "64abb8722fcd95fdf1a0bd8c018431f4291b1f3438cd96376494a59b4fc222f5"
+      }
+    },
+    {
+      "max_abs_error": 0.021927356719970703,
+      "mean_abs_error": 0.0053020077757537365,
+      "passed": true,
+      "prefix_length": 6,
+      "pytorch_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/pytorch.npz",
+        "sha256": "28680c5d7e10e85b192c6c732ee67b92e7f0b8b2dd188330aed5eef87816d0ff"
+      },
+      "request": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/request.npz",
+        "sha256": "1f4924ee509642ef036ecdeea7783fd278fe7cc87692b63aac858d2528e816f1"
+      },
+      "request_fingerprint": "c175da28d900ae5a4248a106a11b536e79d081de0dea22c1f585b49585387bd4",
+      "seed": 0,
+      "shape": [
+        50,
+        6
+      ],
+      "triton_output": {
+        "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/parity/rtc6/triton_final_prefix6.npz",
+        "sha256": "f73538ed78ea17116a755e0fe76a24ed4590b1c73fc8054aa0f7da6f4561fe6d"
+      }
+    }
+  ],
+  "report_type": "lerobot.pi05_realtime_vla_v2_parity",
+  "schema_version": 2,
+  "source_checkpoint": {
+    "config": {
+      "path": "/data/cqy_workspace/tk/lerobot_src/outputs/train/pi05_so101_realtime_vla_v2_full_10epochs_rtc6_seed1000/checkpoints/005613/pretrained_model/config.json",
+      "sha256": "09e3d2866a687a632893d8387510ac2f7153429338965fbf9d485d8b7027d025"
+    },
+    "model": {
+      "path": "/data/cqy_workspace/tk/lerobot_src/outputs/train/pi05_so101_realtime_vla_v2_full_10epochs_rtc6_seed1000/checkpoints/005613/pretrained_model/model.safetensors",
+      "sha256": "3fef6b220f031dd6f376965ca9df74091c5da129c0552696eccce7b06f728125"
+    },
+    "path": "/data/cqy_workspace/tk/lerobot_src/outputs/train/pi05_so101_realtime_vla_v2_full_10epochs_rtc6_seed1000/checkpoints/005613/pretrained_model"
+  },
+  "thresholds": {
+    "atol": 0.08,
+    "rtol": 0.02
+  },
+  "training_max_delay": 6,
+  "triton_export": {
+    "model_config": {
+      "path": "/data/cqy_workspace/tk/lerobot_src/outputs/train/pi05_so101_realtime_vla_v2_full_10epochs_rtc6_seed1000/checkpoints/005613/pretrained_model/config.json",
+      "sha256": "09e3d2866a687a632893d8387510ac2f7153429338965fbf9d485d8b7027d025"
+    },
+    "weights": {
+      "path": "/data/cqy_workspace/tk/lerobot_src/outputs/realtime_vla_v2/pi05_rtc6_triton.pkl",
+      "sha256": "8bb1dcd1e44e035c8a473863a0633cbc8cc63d4946d9a5d41e226080bf7dc088"
+    }
+  }
+}

@@ -1,0 +1,1291 @@
+{
+  "schema_version": 1,
+  "report_type": "lerobot.realtime_vla_v2_trace_acceptance",
+  "overall_pass": false,
+  "source": {
+    "path": "/data/cqy_workspace/tk/lerobot_src/outputs/traces/pi05_realtime_vla_v2_rtc6_triton.jsonl",
+    "sha256": "af2c3912a98058f297e6d83916fc4646a1a3f65a87ceecbe1d662ed41bd24de2",
+    "record_count": 43298,
+    "session_count": 5
+  },
+  "thresholds": {
+    "min_inference_count": 1,
+    "max_inference_p95_ms": null,
+    "max_inference_max_ms": null,
+    "max_planner_fallbacks": 0,
+    "min_speed_beta": null,
+    "max_speed_beta": null,
+    "min_reference_duration_s": null,
+    "max_reference_duration_s": null,
+    "min_queue_merges": 0,
+    "max_queue_stale": 0,
+    "max_queue_underflows": 0,
+    "max_smooth_underruns": 0,
+    "max_command_velocity": null,
+    "max_command_acceleration": null,
+    "max_boundary_jump": null,
+    "require_paper_ready": false
+  },
+  "validation_errors": [],
+  "sessions": [
+    {
+      "session_id": "df8df1f1-6fdc-42f1-b524-0dc5fd6a2739",
+      "pass": false,
+      "record_count": 101,
+      "first_monotonic_timestamp": 15631044.210429344,
+      "last_monotonic_timestamp": 15631045.000394408,
+      "terminal": {
+        "status": "abnormal",
+        "reason": "Realtime executor control failed: safety clamp rewrote the commanded goal on 5 consecutive dispatches (elbow_flex.pos: requested=70.553 applied=77.165, shoulder_lift.pos: requested=-77.155 applied=-82.791) \u2014 the arm is not tracking its targets (obstruction or unintended contact)"
+      },
+      "validation_errors": [],
+      "checks": [
+        {
+          "name": "event_fields_valid",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "event-specific numeric and shape validation"
+        },
+        {
+          "name": "minimum_inference_count",
+          "pass": true,
+          "value": 1,
+          "limit": {
+            "min": 1
+          },
+          "detail": "valid inference latency samples"
+        },
+        {
+          "name": "planner_fallbacks",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "time-axis planner fallbacks"
+        },
+        {
+          "name": "speed_beta_bounds",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "min": null,
+            "max": null
+          },
+          "detail": "speed adapter beta factors outside configured/CLI bounds"
+        },
+        {
+          "name": "reference_duration_bounds",
+          "pass": true,
+          "value": {
+            "reference": 0,
+            "optimized": 0
+          },
+          "limit": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "detail": "reference and optimized segment periods outside bounds"
+        },
+        {
+          "name": "minimum_queue_merges",
+          "pass": true,
+          "value": 1,
+          "limit": {
+            "min": 0
+          },
+          "detail": "queue merge events"
+        },
+        {
+          "name": "queue_stale",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit stale events or generation changes before merge"
+        },
+        {
+          "name": "queue_underflow",
+          "pass": false,
+          "value": 1,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit underflow events or queue exhausted during inference"
+        },
+        {
+          "name": "queue_merge_invariants",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "generation remains stable during inference and increments once on merge"
+        },
+        {
+          "name": "smooth_executor_underruns",
+          "pass": false,
+          "value": 2,
+          "limit": {
+            "max": 0
+          },
+          "detail": "fixed-heartbeat executor underrun ticks"
+        }
+      ],
+      "paper_ready": {
+        "required": false,
+        "pass": false,
+        "issues": [
+          "trace session ended with non-success status 'abnormal'",
+          "calibrated per-joint command dynamics could not be evaluated",
+          "speed_adapter.enabled is not true",
+          "speed adapter resolved checkpoint provenance is missing",
+          "actuator_calibration.enabled is not true",
+          "resolved actuator calibration provenance is missing",
+          "RTC dynamic prefill is not enabled",
+          "sensor_timing_calibration.enabled is not true",
+          "sensor timing configured artifact SHA-256 is missing or invalid",
+          "resolved sensor timing calibration provenance is missing",
+          "time_axis_planner.joint_constraints.enabled is not true",
+          "joint constraint configured artifact SHA-256 is missing or invalid",
+          "resolved joint velocity/acceleration constraint provenance is missing",
+          "trace contains no speed beta diagnostics",
+          "trace contains no planner reference-duration diagnostics"
+        ]
+      },
+      "metrics": {
+        "inference_latency_ms": {
+          "count": 1,
+          "min": 76.95935852825642,
+          "p50": 76.95935852825642,
+          "p95": 76.95935852825642,
+          "max": 76.95935852825642,
+          "mean": 76.95935852825642
+        },
+        "planner": {
+          "evaluated_count": 1,
+          "fallback_count": 0,
+          "fallback_rate": 0.0,
+          "speed_beta": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "speed_beta_bounds": {
+            "min": null,
+            "max": null
+          },
+          "speed_beta_bound_violations": 0,
+          "reference_duration_s": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "segment_duration_s": {
+            "count": 49,
+            "min": 0.032710425175601444,
+            "p50": 0.03346343823915611,
+            "p95": 0.034085227987406305,
+            "max": 0.03606536911276178,
+            "mean": 0.03355782128946942
+          },
+          "duration_bounds_s": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "reference_duration_bound_violations": 0,
+          "segment_duration_bound_violations": 0
+        },
+        "queue": {
+          "merge_count": 1,
+          "stale_count": 0,
+          "underflow_count": 1,
+          "merge_anomaly_count": 0,
+          "min_queue_after_merge": 50
+        },
+        "smooth_executor": {
+          "event_count": 19,
+          "underrun_count": 2,
+          "max_reported_underrun_count": 2
+        },
+        "commands": {
+          "sample_count": 19,
+          "action_dim": 6,
+          "action_keys": [
+            "elbow_flex.pos",
+            "gripper.pos",
+            "shoulder_lift.pos",
+            "shoulder_pan.pos",
+            "wrist_flex.pos",
+            "wrist_roll.pos"
+          ],
+          "velocity_abs": {
+            "count": 108,
+            "min": 0.0,
+            "p50": 9.220619393688786,
+            "p95": 52.77462316338048,
+            "max": 68.50889362590404,
+            "mean": 16.441345576946205
+          },
+          "acceleration_abs": {
+            "count": 102,
+            "min": 5.339112958709182,
+            "p50": 198.74565495298393,
+            "p95": 474.8628939743682,
+            "max": 988.5143992420587,
+            "mean": 231.63688194744253
+          },
+          "adjacent_jump_abs": {
+            "count": 18,
+            "min": 0.0,
+            "p50": 1.4516971916971926,
+            "p95": 2.160740821964093,
+            "max": 2.29047619047617,
+            "mean": 1.423304843304843
+          },
+          "boundary_jump_abs": {
+            "count": 1,
+            "min": 0.4399999999999995,
+            "p50": 0.4399999999999995,
+            "p95": 0.4399999999999995,
+            "max": 0.4399999999999995,
+            "mean": 0.4399999999999995
+          },
+          "source": "dispatch.applied_command",
+          "calibrated_constraints": {
+            "available": false,
+            "reason": "resolved joint constraints are missing",
+            "velocity_violation_count": 0,
+            "acceleration_violation_count": 0,
+            "boundary_violation_count": 0,
+            "boundary_rule": "abs(delta_q[j]) <= max_velocity[j] * actual_elapsed_s"
+          }
+        },
+        "event_counts": {
+          "dispatch": 19,
+          "dispatch_result": 19,
+          "executor_control": 19,
+          "inference_chunk": 1,
+          "observation": 20,
+          "queue_merge": 1,
+          "session_end": 1,
+          "session_start": 1,
+          "smooth_execution": 19,
+          "stall_hold": 1
+        }
+      }
+    },
+    {
+      "session_id": "a719914c-22b3-477c-94bc-be171e11fff5",
+      "pass": false,
+      "record_count": 166,
+      "first_monotonic_timestamp": 15631641.675633108,
+      "last_monotonic_timestamp": 15631642.883983549,
+      "terminal": {
+        "status": "abnormal",
+        "reason": "committed action prefill exceeds capacity: required_steps=7, max_steps=6"
+      },
+      "validation_errors": [],
+      "checks": [
+        {
+          "name": "event_fields_valid",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "event-specific numeric and shape validation"
+        },
+        {
+          "name": "minimum_inference_count",
+          "pass": true,
+          "value": 1,
+          "limit": {
+            "min": 1
+          },
+          "detail": "valid inference latency samples"
+        },
+        {
+          "name": "planner_fallbacks",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "time-axis planner fallbacks"
+        },
+        {
+          "name": "speed_beta_bounds",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "min": null,
+            "max": null
+          },
+          "detail": "speed adapter beta factors outside configured/CLI bounds"
+        },
+        {
+          "name": "reference_duration_bounds",
+          "pass": true,
+          "value": {
+            "reference": 0,
+            "optimized": 0
+          },
+          "limit": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "detail": "reference and optimized segment periods outside bounds"
+        },
+        {
+          "name": "minimum_queue_merges",
+          "pass": true,
+          "value": 1,
+          "limit": {
+            "min": 0
+          },
+          "detail": "queue merge events"
+        },
+        {
+          "name": "queue_stale",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit stale events or generation changes before merge"
+        },
+        {
+          "name": "queue_underflow",
+          "pass": false,
+          "value": 1,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit underflow events or queue exhausted during inference"
+        },
+        {
+          "name": "queue_merge_invariants",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "generation remains stable during inference and increments once on merge"
+        },
+        {
+          "name": "smooth_executor_underruns",
+          "pass": false,
+          "value": 2,
+          "limit": {
+            "max": 0
+          },
+          "detail": "fixed-heartbeat executor underrun ticks"
+        }
+      ],
+      "paper_ready": {
+        "required": false,
+        "pass": false,
+        "issues": [
+          "trace session ended with non-success status 'abnormal'",
+          "calibrated per-joint command dynamics could not be evaluated",
+          "speed_adapter.enabled is not true",
+          "speed adapter resolved checkpoint provenance is missing",
+          "actuator_calibration.enabled is not true",
+          "resolved actuator calibration provenance is missing",
+          "RTC dynamic prefill is not enabled",
+          "sensor_timing_calibration.enabled is not true",
+          "sensor timing configured artifact SHA-256 is missing or invalid",
+          "resolved sensor timing calibration provenance is missing",
+          "time_axis_planner.joint_constraints.enabled is not true",
+          "joint constraint configured artifact SHA-256 is missing or invalid",
+          "resolved joint velocity/acceleration constraint provenance is missing",
+          "trace contains no speed beta diagnostics",
+          "trace contains no planner reference-duration diagnostics"
+        ]
+      },
+      "metrics": {
+        "inference_latency_ms": {
+          "count": 1,
+          "min": 71.39689289033413,
+          "p50": 71.39689289033413,
+          "p95": 71.39689289033413,
+          "max": 71.39689289033413,
+          "mean": 71.39689289033413
+        },
+        "planner": {
+          "evaluated_count": 1,
+          "fallback_count": 0,
+          "fallback_rate": 0.0,
+          "speed_beta": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "speed_beta_bounds": {
+            "min": null,
+            "max": null
+          },
+          "speed_beta_bound_violations": 0,
+          "reference_duration_s": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "segment_duration_s": {
+            "count": 49,
+            "min": 0.032478557847368375,
+            "p50": 0.03358626393718795,
+            "p95": 0.03509180940962163,
+            "max": 0.03659648601673553,
+            "mean": 0.033737045701540715
+          },
+          "duration_bounds_s": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "reference_duration_bound_violations": 0,
+          "segment_duration_bound_violations": 0
+        },
+        "queue": {
+          "merge_count": 1,
+          "stale_count": 0,
+          "underflow_count": 1,
+          "merge_anomaly_count": 0,
+          "min_queue_after_merge": 50
+        },
+        "smooth_executor": {
+          "event_count": 32,
+          "underrun_count": 2,
+          "max_reported_underrun_count": 2
+        },
+        "commands": {
+          "sample_count": 32,
+          "action_dim": 6,
+          "action_keys": [
+            "elbow_flex.pos",
+            "gripper.pos",
+            "shoulder_lift.pos",
+            "shoulder_pan.pos",
+            "wrist_flex.pos",
+            "wrist_roll.pos"
+          ],
+          "velocity_abs": {
+            "count": 186,
+            "min": 0.0,
+            "p50": 14.589773718581263,
+            "p95": 95.32208002550749,
+            "max": 96.66258609449886,
+            "mean": 34.711748599752866
+          },
+          "acceleration_abs": {
+            "count": 180,
+            "min": 0.1400501653670832,
+            "p50": 146.39350338118595,
+            "p95": 439.00470873500205,
+            "max": 931.8241281970443,
+            "mean": 184.82475095697737
+          },
+          "adjacent_jump_abs": {
+            "count": 31,
+            "min": 0.0,
+            "p50": 3.1666666666666643,
+            "p95": 3.1666666666666714,
+            "max": 3.1666666666666714,
+            "mean": 2.5495309540014874
+          },
+          "boundary_jump_abs": {
+            "count": 1,
+            "min": 0.43999999999999995,
+            "p50": 0.43999999999999995,
+            "p95": 0.43999999999999995,
+            "max": 0.43999999999999995,
+            "mean": 0.43999999999999995
+          },
+          "source": "dispatch.applied_command",
+          "calibrated_constraints": {
+            "available": false,
+            "reason": "resolved joint constraints are missing",
+            "velocity_violation_count": 0,
+            "acceleration_violation_count": 0,
+            "boundary_violation_count": 0,
+            "boundary_rule": "abs(delta_q[j]) <= max_velocity[j] * actual_elapsed_s"
+          }
+        },
+        "event_counts": {
+          "dispatch": 32,
+          "dispatch_result": 32,
+          "executor_control": 33,
+          "inference_chunk": 1,
+          "observation": 33,
+          "queue_merge": 1,
+          "session_end": 1,
+          "session_start": 1,
+          "smooth_execution": 32
+        }
+      }
+    },
+    {
+      "session_id": "cb9f345f-efd7-45d9-b3ec-d8beb0aa2930",
+      "pass": false,
+      "record_count": 1414,
+      "first_monotonic_timestamp": 15632094.186523864,
+      "last_monotonic_timestamp": 15632103.633877685,
+      "terminal": {
+        "status": "abnormal",
+        "reason": "Realtime executor control failed: executor control schedule moved backwards: scheduled=15632103.487973850, executor=15632103.487973886"
+      },
+      "validation_errors": [],
+      "checks": [
+        {
+          "name": "event_fields_valid",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "event-specific numeric and shape validation"
+        },
+        {
+          "name": "minimum_inference_count",
+          "pass": true,
+          "value": 10,
+          "limit": {
+            "min": 1
+          },
+          "detail": "valid inference latency samples"
+        },
+        {
+          "name": "planner_fallbacks",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "time-axis planner fallbacks"
+        },
+        {
+          "name": "speed_beta_bounds",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "min": null,
+            "max": null
+          },
+          "detail": "speed adapter beta factors outside configured/CLI bounds"
+        },
+        {
+          "name": "reference_duration_bounds",
+          "pass": true,
+          "value": {
+            "reference": 0,
+            "optimized": 0
+          },
+          "limit": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "detail": "reference and optimized segment periods outside bounds"
+        },
+        {
+          "name": "minimum_queue_merges",
+          "pass": true,
+          "value": 10,
+          "limit": {
+            "min": 0
+          },
+          "detail": "queue merge events"
+        },
+        {
+          "name": "queue_stale",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit stale events or generation changes before merge"
+        },
+        {
+          "name": "queue_underflow",
+          "pass": false,
+          "value": 1,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit underflow events or queue exhausted during inference"
+        },
+        {
+          "name": "queue_merge_invariants",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "generation remains stable during inference and increments once on merge"
+        },
+        {
+          "name": "smooth_executor_underruns",
+          "pass": false,
+          "value": 2,
+          "limit": {
+            "max": 0
+          },
+          "detail": "fixed-heartbeat executor underrun ticks"
+        }
+      ],
+      "paper_ready": {
+        "required": false,
+        "pass": false,
+        "issues": [
+          "trace session ended with non-success status 'abnormal'",
+          "calibrated per-joint command dynamics could not be evaluated",
+          "speed_adapter.enabled is not true",
+          "speed adapter resolved checkpoint provenance is missing",
+          "actuator_calibration.enabled is not true",
+          "resolved actuator calibration provenance is missing",
+          "RTC dynamic prefill is not enabled",
+          "sensor_timing_calibration.enabled is not true",
+          "sensor timing configured artifact SHA-256 is missing or invalid",
+          "resolved sensor timing calibration provenance is missing",
+          "time_axis_planner.joint_constraints.enabled is not true",
+          "joint constraint configured artifact SHA-256 is missing or invalid",
+          "resolved joint velocity/acceleration constraint provenance is missing",
+          "trace contains no speed beta diagnostics",
+          "trace contains no planner reference-duration diagnostics"
+        ]
+      },
+      "metrics": {
+        "inference_latency_ms": {
+          "count": 10,
+          "min": 44.02260668575764,
+          "p50": 45.27023155242205,
+          "p95": 61.6074791178107,
+          "max": 72.96320609748363,
+          "mean": 48.132879473268986
+        },
+        "planner": {
+          "evaluated_count": 10,
+          "fallback_count": 0,
+          "fallback_rate": 0.0,
+          "speed_beta": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "speed_beta_bounds": {
+            "min": null,
+            "max": null
+          },
+          "speed_beta_bound_violations": 0,
+          "reference_duration_s": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "segment_duration_s": {
+            "count": 490,
+            "min": 0.03226359623808967,
+            "p50": 0.03358936129513923,
+            "p95": 0.040217189495717266,
+            "max": 0.05271655524230061,
+            "mean": 0.03460836361467016
+          },
+          "duration_bounds_s": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "reference_duration_bound_violations": 0,
+          "segment_duration_bound_violations": 0
+        },
+        "queue": {
+          "merge_count": 10,
+          "stale_count": 0,
+          "underflow_count": 1,
+          "merge_anomaly_count": 0,
+          "min_queue_after_merge": 49
+        },
+        "smooth_executor": {
+          "event_count": 278,
+          "underrun_count": 2,
+          "max_reported_underrun_count": 2
+        },
+        "commands": {
+          "sample_count": 278,
+          "action_dim": 6,
+          "action_keys": [
+            "elbow_flex.pos",
+            "gripper.pos",
+            "shoulder_lift.pos",
+            "shoulder_pan.pos",
+            "wrist_flex.pos",
+            "wrist_roll.pos"
+          ],
+          "velocity_abs": {
+            "count": 1662,
+            "min": 0.0,
+            "p50": 14.725776573288881,
+            "p95": 95.26130602681734,
+            "max": 106.61238672630557,
+            "mean": 28.95489122378619
+          },
+          "acceleration_abs": {
+            "count": 1656,
+            "min": 0.07688246163927134,
+            "p50": 215.12675373742115,
+            "p95": 478.7279526656697,
+            "max": 950.0451117128442,
+            "mean": 226.48098442803126
+          },
+          "adjacent_jump_abs": {
+            "count": 277,
+            "min": 0.0,
+            "p50": 2.5474898748171118,
+            "p95": 3.4000000000000004,
+            "max": 3.400000000000002,
+            "mean": 2.251483184741089
+          },
+          "boundary_jump_abs": {
+            "count": 10,
+            "min": 0.5277777777777715,
+            "p50": 2.463686437455433,
+            "p95": 3.3999999999999986,
+            "max": 3.3999999999999986,
+            "mean": 2.3171646126242105
+          },
+          "source": "dispatch.applied_command",
+          "calibrated_constraints": {
+            "available": false,
+            "reason": "resolved joint constraints are missing",
+            "velocity_violation_count": 0,
+            "acceleration_violation_count": 0,
+            "boundary_violation_count": 0,
+            "boundary_rule": "abs(delta_q[j]) <= max_velocity[j] * actual_elapsed_s"
+          }
+        },
+        "event_counts": {
+          "dispatch": 278,
+          "dispatch_result": 278,
+          "executor_control": 279,
+          "inference_chunk": 10,
+          "observation": 279,
+          "queue_merge": 10,
+          "session_end": 1,
+          "session_start": 1,
+          "smooth_execution": 278
+        }
+      }
+    },
+    {
+      "session_id": "a0f34c95-da9b-4356-afcb-35592971c3cc",
+      "pass": false,
+      "record_count": 34683,
+      "first_monotonic_timestamp": 15632596.370418575,
+      "last_monotonic_timestamp": 15632824.791351678,
+      "terminal": {
+        "status": "completed",
+        "reason": null
+      },
+      "validation_errors": [],
+      "checks": [
+        {
+          "name": "event_fields_valid",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "event-specific numeric and shape validation"
+        },
+        {
+          "name": "minimum_inference_count",
+          "pass": true,
+          "value": 229,
+          "limit": {
+            "min": 1
+          },
+          "detail": "valid inference latency samples"
+        },
+        {
+          "name": "planner_fallbacks",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "time-axis planner fallbacks"
+        },
+        {
+          "name": "speed_beta_bounds",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "min": null,
+            "max": null
+          },
+          "detail": "speed adapter beta factors outside configured/CLI bounds"
+        },
+        {
+          "name": "reference_duration_bounds",
+          "pass": true,
+          "value": {
+            "reference": 0,
+            "optimized": 0
+          },
+          "limit": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "detail": "reference and optimized segment periods outside bounds"
+        },
+        {
+          "name": "minimum_queue_merges",
+          "pass": true,
+          "value": 229,
+          "limit": {
+            "min": 0
+          },
+          "detail": "queue merge events"
+        },
+        {
+          "name": "queue_stale",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit stale events or generation changes before merge"
+        },
+        {
+          "name": "queue_underflow",
+          "pass": false,
+          "value": 1,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit underflow events or queue exhausted during inference"
+        },
+        {
+          "name": "queue_merge_invariants",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "generation remains stable during inference and increments once on merge"
+        },
+        {
+          "name": "smooth_executor_underruns",
+          "pass": false,
+          "value": 2,
+          "limit": {
+            "max": 0
+          },
+          "detail": "fixed-heartbeat executor underrun ticks"
+        }
+      ],
+      "paper_ready": {
+        "required": false,
+        "pass": false,
+        "issues": [
+          "calibrated per-joint command dynamics could not be evaluated",
+          "speed_adapter.enabled is not true",
+          "speed adapter resolved checkpoint provenance is missing",
+          "actuator_calibration.enabled is not true",
+          "resolved actuator calibration provenance is missing",
+          "RTC dynamic prefill is not enabled",
+          "sensor_timing_calibration.enabled is not true",
+          "sensor timing configured artifact SHA-256 is missing or invalid",
+          "resolved sensor timing calibration provenance is missing",
+          "time_axis_planner.joint_constraints.enabled is not true",
+          "joint constraint configured artifact SHA-256 is missing or invalid",
+          "resolved joint velocity/acceleration constraint provenance is missing",
+          "trace contains no speed beta diagnostics",
+          "trace contains no planner reference-duration diagnostics"
+        ]
+      },
+      "metrics": {
+        "inference_latency_ms": {
+          "count": 229,
+          "min": 43.974608182907104,
+          "p50": 45.606520026922226,
+          "p95": 58.3601962774992,
+          "max": 84.29104834794998,
+          "mean": 47.63558071806181
+        },
+        "planner": {
+          "evaluated_count": 229,
+          "fallback_count": 0,
+          "fallback_rate": 0.0,
+          "speed_beta": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "speed_beta_bounds": {
+            "min": null,
+            "max": null
+          },
+          "speed_beta_bound_violations": 0,
+          "reference_duration_s": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "segment_duration_s": {
+            "count": 11221,
+            "min": 0.030487529381678077,
+            "p50": 0.03392374850585204,
+            "p95": 0.046783239786014175,
+            "max": 0.09090387448222362,
+            "mean": 0.03625954245290088
+          },
+          "duration_bounds_s": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "reference_duration_bound_violations": 0,
+          "segment_duration_bound_violations": 0
+        },
+        "queue": {
+          "merge_count": 229,
+          "stale_count": 0,
+          "underflow_count": 1,
+          "merge_anomaly_count": 0,
+          "min_queue_after_merge": 48
+        },
+        "smooth_executor": {
+          "event_count": 6847,
+          "underrun_count": 2,
+          "max_reported_underrun_count": 2
+        },
+        "commands": {
+          "sample_count": 6847,
+          "action_dim": 6,
+          "action_keys": [
+            "elbow_flex.pos",
+            "gripper.pos",
+            "shoulder_lift.pos",
+            "shoulder_pan.pos",
+            "wrist_flex.pos",
+            "wrist_roll.pos"
+          ],
+          "velocity_abs": {
+            "count": 41076,
+            "min": 0.0,
+            "p50": 9.72700536569396,
+            "p95": 95.0224076711684,
+            "max": 113.5574030347858,
+            "mean": 22.956636882468302
+          },
+          "acceleration_abs": {
+            "count": 41070,
+            "min": 0.0,
+            "p50": 161.6858812409584,
+            "p95": 475.7714038881405,
+            "max": 1467.5237421208308,
+            "mean": 207.61829326868494
+          },
+          "adjacent_jump_abs": {
+            "count": 6846,
+            "min": 0.0,
+            "p50": 1.8675337646120553,
+            "p95": 3.4,
+            "max": 3.400000000000002,
+            "mean": 1.8396484718128778
+          },
+          "boundary_jump_abs": {
+            "count": 229,
+            "min": 0.10468884536198209,
+            "p50": 1.7666666666666657,
+            "p95": 3.3999999999999986,
+            "max": 3.4000000000000004,
+            "mean": 1.7557239891788272
+          },
+          "source": "dispatch.applied_command",
+          "calibrated_constraints": {
+            "available": false,
+            "reason": "resolved joint constraints are missing",
+            "velocity_violation_count": 0,
+            "acceleration_violation_count": 0,
+            "boundary_violation_count": 0,
+            "boundary_rule": "abs(delta_q[j]) <= max_velocity[j] * actual_elapsed_s"
+          }
+        },
+        "event_counts": {
+          "dispatch": 6847,
+          "dispatch_result": 6847,
+          "executor_control": 6848,
+          "inference_chunk": 229,
+          "observation": 6834,
+          "queue_merge": 229,
+          "session_end": 1,
+          "session_start": 1,
+          "smooth_execution": 6847
+        }
+      }
+    },
+    {
+      "session_id": "03dafbfc-ff00-410f-bf77-5704bdfe7ecd",
+      "pass": false,
+      "record_count": 6934,
+      "first_monotonic_timestamp": 15635903.457622817,
+      "last_monotonic_timestamp": 15635979.13568598,
+      "terminal": {
+        "status": "completed",
+        "reason": null
+      },
+      "validation_errors": [],
+      "checks": [
+        {
+          "name": "event_fields_valid",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "event-specific numeric and shape validation"
+        },
+        {
+          "name": "minimum_inference_count",
+          "pass": true,
+          "value": 76,
+          "limit": {
+            "min": 1
+          },
+          "detail": "valid inference latency samples"
+        },
+        {
+          "name": "planner_fallbacks",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "time-axis planner fallbacks"
+        },
+        {
+          "name": "speed_beta_bounds",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "min": null,
+            "max": null
+          },
+          "detail": "speed adapter beta factors outside configured/CLI bounds"
+        },
+        {
+          "name": "reference_duration_bounds",
+          "pass": true,
+          "value": {
+            "reference": 0,
+            "optimized": 0
+          },
+          "limit": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "detail": "reference and optimized segment periods outside bounds"
+        },
+        {
+          "name": "minimum_queue_merges",
+          "pass": true,
+          "value": 76,
+          "limit": {
+            "min": 0
+          },
+          "detail": "queue merge events"
+        },
+        {
+          "name": "queue_stale",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit stale events or generation changes before merge"
+        },
+        {
+          "name": "queue_underflow",
+          "pass": false,
+          "value": 1,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit underflow events or queue exhausted during inference"
+        },
+        {
+          "name": "queue_merge_invariants",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "generation remains stable during inference and increments once on merge"
+        },
+        {
+          "name": "smooth_executor_underruns",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "fixed-heartbeat executor underrun ticks"
+        }
+      ],
+      "paper_ready": {
+        "required": false,
+        "pass": false,
+        "issues": [
+          "calibrated per-joint command dynamics could not be evaluated",
+          "speed_adapter.enabled is not true",
+          "speed adapter resolved checkpoint provenance is missing",
+          "realtime_executor.enabled is not true",
+          "actuator_calibration.enabled is not true",
+          "resolved actuator calibration provenance is missing",
+          "RTC dynamic prefill is not enabled",
+          "sensor_timing_calibration.enabled is not true",
+          "sensor timing configured artifact SHA-256 is missing or invalid",
+          "resolved sensor timing calibration provenance is missing",
+          "time_axis_planner.joint_constraints.enabled is not true",
+          "joint constraint configured artifact SHA-256 is missing or invalid",
+          "resolved joint velocity/acceleration constraint provenance is missing",
+          "trace contains no speed beta diagnostics",
+          "trace contains no planner reference-duration diagnostics",
+          "trace contains no smooth executor heartbeat events"
+        ]
+      },
+      "metrics": {
+        "inference_latency_ms": {
+          "count": 76,
+          "min": 43.755410239100456,
+          "p50": 45.200916938483715,
+          "p95": 57.77201894670725,
+          "max": 85.0791446864605,
+          "mean": 47.50687420662297
+        },
+        "planner": {
+          "evaluated_count": 76,
+          "fallback_count": 0,
+          "fallback_rate": 0.0,
+          "speed_beta": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "speed_beta_bounds": {
+            "min": null,
+            "max": null
+          },
+          "speed_beta_bound_violations": 0,
+          "reference_duration_s": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "segment_duration_s": {
+            "count": 3724,
+            "min": 0.02993868825406669,
+            "p50": 0.034096854557324516,
+            "p95": 0.04838284518085689,
+            "max": 0.0952351419402152,
+            "mean": 0.03690278589598207
+          },
+          "duration_bounds_s": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "reference_duration_bound_violations": 0,
+          "segment_duration_bound_violations": 0
+        },
+        "queue": {
+          "merge_count": 76,
+          "stale_count": 0,
+          "underflow_count": 1,
+          "merge_anomaly_count": 0,
+          "min_queue_after_merge": 48
+        },
+        "smooth_executor": {
+          "event_count": 0,
+          "underrun_count": 0,
+          "max_reported_underrun_count": 0
+        },
+        "commands": {
+          "sample_count": 2259,
+          "action_dim": 6,
+          "action_keys": [
+            "elbow_flex.pos",
+            "gripper.pos",
+            "shoulder_lift.pos",
+            "shoulder_pan.pos",
+            "wrist_flex.pos",
+            "wrist_roll.pos"
+          ],
+          "velocity_abs": {
+            "count": 13548,
+            "min": 0.0,
+            "p50": 4.40986784214991,
+            "p95": 75.58371229847857,
+            "max": 234.61991844405313,
+            "mean": 15.349353022784243
+          },
+          "acceleration_abs": {
+            "count": 13542,
+            "min": 0.0,
+            "p50": 97.86535453525582,
+            "p95": 576.9117783969325,
+            "max": 5584.269061481848,
+            "mean": 169.31805000999992
+          },
+          "adjacent_jump_abs": {
+            "count": 2258,
+            "min": 0.0,
+            "p50": 0.7083969116210938,
+            "p95": 4.804777145385742,
+            "max": 7.7984771728515625,
+            "mean": 1.417737881940904
+          },
+          "boundary_jump_abs": {
+            "count": 75,
+            "min": 0.04492521286010742,
+            "p50": 0.6314334869384766,
+            "p95": 3.6408469676971427,
+            "max": 4.478970527648926,
+            "mean": 1.1435578489303588
+          },
+          "source": "dispatch.applied_command",
+          "calibrated_constraints": {
+            "available": false,
+            "reason": "resolved joint constraints are missing",
+            "velocity_violation_count": 0,
+            "acceleration_violation_count": 0,
+            "boundary_violation_count": 0,
+            "boundary_rule": "abs(delta_q[j]) <= max_velocity[j] * actual_elapsed_s"
+          }
+        },
+        "event_counts": {
+          "dispatch": 2259,
+          "dispatch_result": 2259,
+          "inference_chunk": 76,
+          "observation": 2262,
+          "queue_merge": 76,
+          "session_end": 1,
+          "session_start": 1
+        }
+      }
+    }
+  ]
+}

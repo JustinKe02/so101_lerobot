@@ -1,0 +1,283 @@
+{
+  "schema_version": 1,
+  "report_type": "lerobot.realtime_vla_v2_trace_acceptance",
+  "overall_pass": false,
+  "source": {
+    "path": "/data/cqy_workspace/tk/lerobot_src/outputs/traces/pi05_rtc6_triton_direct_rolling_p95.jsonl",
+    "sha256": "8f0e52556673a9d148e6dcb3371410ec98cfa76b287e8fd63e67590fe23efca2",
+    "record_count": 4118,
+    "session_count": 1
+  },
+  "thresholds": {
+    "min_inference_count": 1,
+    "max_inference_p95_ms": null,
+    "max_inference_max_ms": null,
+    "max_planner_fallbacks": 0,
+    "min_speed_beta": null,
+    "max_speed_beta": null,
+    "min_reference_duration_s": null,
+    "max_reference_duration_s": null,
+    "min_queue_merges": 0,
+    "max_queue_stale": 0,
+    "max_queue_underflows": 0,
+    "max_smooth_underruns": 0,
+    "max_command_velocity": null,
+    "max_command_acceleration": null,
+    "max_boundary_jump": null,
+    "require_paper_ready": false
+  },
+  "validation_errors": [],
+  "sessions": [
+    {
+      "session_id": "e58c58a5-40d2-4a15-b0af-b24ea7ba5079",
+      "pass": false,
+      "record_count": 4118,
+      "first_monotonic_timestamp": 15644816.669166345,
+      "last_monotonic_timestamp": 15644861.727097506,
+      "terminal": {
+        "status": "completed",
+        "reason": null
+      },
+      "validation_errors": [],
+      "checks": [
+        {
+          "name": "event_fields_valid",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "event-specific numeric and shape validation"
+        },
+        {
+          "name": "minimum_inference_count",
+          "pass": true,
+          "value": 45,
+          "limit": {
+            "min": 1
+          },
+          "detail": "valid inference latency samples"
+        },
+        {
+          "name": "planner_fallbacks",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "time-axis planner fallbacks"
+        },
+        {
+          "name": "speed_beta_bounds",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "min": null,
+            "max": null
+          },
+          "detail": "speed adapter beta factors outside configured/CLI bounds"
+        },
+        {
+          "name": "reference_duration_bounds",
+          "pass": true,
+          "value": {
+            "reference": 0,
+            "optimized": 0
+          },
+          "limit": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "detail": "reference and optimized segment periods outside bounds"
+        },
+        {
+          "name": "minimum_queue_merges",
+          "pass": true,
+          "value": 45,
+          "limit": {
+            "min": 0
+          },
+          "detail": "queue merge events"
+        },
+        {
+          "name": "queue_stale",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit stale events or generation changes before merge"
+        },
+        {
+          "name": "queue_underflow",
+          "pass": false,
+          "value": 1,
+          "limit": {
+            "max": 0
+          },
+          "detail": "explicit underflow events or queue exhausted during inference"
+        },
+        {
+          "name": "queue_merge_invariants",
+          "pass": true,
+          "value": 0,
+          "limit": 0,
+          "detail": "generation remains stable during inference and increments once on merge"
+        },
+        {
+          "name": "smooth_executor_underruns",
+          "pass": true,
+          "value": 0,
+          "limit": {
+            "max": 0
+          },
+          "detail": "fixed-heartbeat executor underrun ticks"
+        }
+      ],
+      "paper_ready": {
+        "required": false,
+        "pass": false,
+        "issues": [
+          "calibrated per-joint command dynamics could not be evaluated",
+          "speed_adapter.enabled is not true",
+          "speed adapter resolved checkpoint provenance is missing",
+          "realtime_executor.enabled is not true",
+          "actuator_calibration.enabled is not true",
+          "resolved actuator calibration provenance is missing",
+          "RTC dynamic prefill is not enabled",
+          "sensor_timing_calibration.enabled is not true",
+          "sensor timing configured artifact SHA-256 is missing or invalid",
+          "resolved sensor timing calibration provenance is missing",
+          "time_axis_planner.joint_constraints.enabled is not true",
+          "joint constraint configured artifact SHA-256 is missing or invalid",
+          "resolved joint velocity/acceleration constraint provenance is missing",
+          "trace contains no speed beta diagnostics",
+          "trace contains no planner reference-duration diagnostics",
+          "trace contains no smooth executor heartbeat events"
+        ]
+      },
+      "metrics": {
+        "inference_latency_ms": {
+          "count": 45,
+          "min": 44.434692710638046,
+          "p50": 46.04239761829376,
+          "p95": 57.845088839530945,
+          "max": 73.6545231193304,
+          "mean": 48.6476564158996
+        },
+        "planner": {
+          "evaluated_count": 45,
+          "fallback_count": 0,
+          "fallback_rate": 0.0,
+          "speed_beta": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "speed_beta_bounds": {
+            "min": null,
+            "max": null
+          },
+          "speed_beta_bound_violations": 0,
+          "reference_duration_s": {
+            "count": 0,
+            "min": null,
+            "p50": null,
+            "p95": null,
+            "max": null,
+            "mean": null
+          },
+          "segment_duration_s": {
+            "count": 2205,
+            "min": 0.031293511113628825,
+            "p50": 0.03368968145076689,
+            "p95": 0.043743604424375644,
+            "max": 0.06405945564510754,
+            "mean": 0.035323530181490106
+          },
+          "duration_bounds_s": {
+            "min": 0.02,
+            "max": 0.1
+          },
+          "reference_duration_bound_violations": 0,
+          "segment_duration_bound_violations": 0
+        },
+        "queue": {
+          "merge_count": 45,
+          "stale_count": 0,
+          "underflow_count": 1,
+          "merge_anomaly_count": 0,
+          "min_queue_after_merge": 48
+        },
+        "smooth_executor": {
+          "event_count": 0,
+          "underrun_count": 0,
+          "max_reported_underrun_count": 0
+        },
+        "commands": {
+          "sample_count": 1341,
+          "action_dim": 6,
+          "action_keys": [
+            "elbow_flex.pos",
+            "gripper.pos",
+            "shoulder_lift.pos",
+            "shoulder_pan.pos",
+            "wrist_flex.pos",
+            "wrist_roll.pos"
+          ],
+          "velocity_abs": {
+            "count": 8040,
+            "min": 0.0,
+            "p50": 7.435666188522898,
+            "p95": 92.62294706495747,
+            "max": 232.59243630567897,
+            "mean": 20.85233858256099
+          },
+          "acceleration_abs": {
+            "count": 8034,
+            "min": 0.0,
+            "p50": 137.86339444339444,
+            "p95": 672.2088826927429,
+            "max": 3641.3173515993158,
+            "mean": 209.1430960441494
+          },
+          "adjacent_jump_abs": {
+            "count": 1340,
+            "min": 0.01766514778137207,
+            "p50": 1.4452247619628906,
+            "p95": 5.008940124511718,
+            "max": 7.737135887145996,
+            "mean": 1.9175138235092164
+          },
+          "boundary_jump_abs": {
+            "count": 44,
+            "min": 0.03089141845703125,
+            "p50": 1.8066482543945312,
+            "p95": 4.2408835887908936,
+            "max": 5.282670021057129,
+            "mean": 1.845952957868576
+          },
+          "source": "dispatch.applied_command",
+          "calibrated_constraints": {
+            "available": false,
+            "reason": "resolved joint constraints are missing",
+            "velocity_violation_count": 0,
+            "acceleration_violation_count": 0,
+            "boundary_violation_count": 0,
+            "boundary_rule": "abs(delta_q[j]) <= max_velocity[j] * actual_elapsed_s"
+          }
+        },
+        "event_counts": {
+          "dispatch": 1341,
+          "dispatch_result": 1341,
+          "inference_chunk": 45,
+          "observation": 1344,
+          "queue_merge": 45,
+          "session_end": 1,
+          "session_start": 1
+        }
+      }
+    }
+  ]
+}
